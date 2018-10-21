@@ -86,7 +86,7 @@ private[v1] object AllJobsResource {
         numTasks = job.numTasks,
         numActiveTasks = job.numActiveTasks,
         numCompletedTasks = job.numCompletedTasks,
-        numSkippedTasks = job.numSkippedTasks,
+        numSkippedTasks = job.numCompletedTasks,
         numFailedTasks = job.numFailedTasks,
         numActiveStages = job.numActiveStages,
         numCompletedStages = job.completedStageIndices.size,

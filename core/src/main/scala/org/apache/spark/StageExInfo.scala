@@ -15,22 +15,17 @@
  * limitations under the License.
  */
 
-package org.apache.spark.util
+package org.apache.spark
+
+import scala.collection.mutable
 
 /**
- * Extractor Object for pulling out the root cause of an error.
- * If the error contains no cause, it will return the error itself.
- *
- * Usage:
- * try {
- *   ...
- * } catch {
- *   case CausedBy(ex: CommitDeniedException) => ...
- * }
- */
-private[spark] object CausedBy {
+  * DS to store info of a stage.
+  */
+class StageExInfo(val stageId: Int,
+                  val alreadyPerRddSet: Set[Int], // prs
+                  val afterPerRddSet: Set[Int], // aprs
+                  val depMap: mutable.HashMap[Int, Set[Int]],
+                  val curRunningRddMap: mutable.HashMap[Int, Set[Int]]) {
 
-  def unapply(e: Throwable): Option[Throwable] = {
-    Option(e.getCause).flatMap(cause => unapply(cause)).orElse(Some(e))
-  }
 }

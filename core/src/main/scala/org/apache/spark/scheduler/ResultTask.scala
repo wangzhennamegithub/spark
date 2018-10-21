@@ -17,9 +17,10 @@
 
 package org.apache.spark.scheduler
 
+import java.io._
 import java.nio.ByteBuffer
 
-import java.io._
+import scala.collection.mutable.HashMap
 
 import org.apache.spark._
 import org.apache.spark.broadcast.Broadcast
@@ -31,6 +32,7 @@ import org.apache.spark.rdd.RDD
  * See [[Task]] for more information.
  *
  * @param stageId id of the stage this task belongs to
+ * @param stageAttemptId attempt id of the stage this task belongs to
  * @param taskBinary broadcasted version of the serialized RDD and the function to apply on each
  *                   partition of the given RDD. Once deserialized, the type should be
  *                   (RDD[T], (TaskContext, Iterator[T]) => U).
@@ -38,6 +40,9 @@ import org.apache.spark.rdd.RDD
  * @param locs preferred task execution locations for locality scheduling
  * @param outputId index of the task in this job (a job can launch tasks on only a subset of the
  *                 input RDD's partitions).
+ * @param _initialAccums initial set of accumulators to be used in this task for tracking
+ *                       internal metrics. Other accumulators will be registered later when
+ *                       they are deserialized on the executors.
  */
 private[spark] class ResultTask[T, U](
     stageId: Int,
@@ -46,9 +51,11 @@ private[spark] class ResultTask[T, U](
     partition: Partition,
     locs: Seq[TaskLocation],
     val outputId: Int,
-    internalAccumulators: Seq[Accumulator[Long]])
-  extends Task[U](stageId, stageAttemptId, partition.index, internalAccumulators)
-  with Serializable {
+    _initialAccums: Seq[Accumulator[_]] = InternalAccumulator.createAll(),
+    depMap: HashMap[Int, Set[Int]] = null,
+    curRunningRddMap: HashMap[Int, Set[Int]] = null)
+  extends Task[U](stageId, stageAttemptId, partition.index, _initialAccums, depMap,
+    curRunningRddMap) with Serializable {
 
   @transient private[this] val preferredLocs: Seq[TaskLocation] = {
     if (locs == null) Nil else locs.toSet.toSeq
