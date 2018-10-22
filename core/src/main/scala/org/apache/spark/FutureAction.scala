@@ -28,7 +28,6 @@ import org.apache.spark.annotation.DeveloperApi
 import org.apache.spark.api.java.JavaFutureAction
 import org.apache.spark.rdd.RDD
 import org.apache.spark.scheduler.JobWaiter
-import org.apache.spark.util.ThreadUtils
 
 
 /**
@@ -42,11 +41,10 @@ trait FutureAction[T] extends Future[T] {
   /**
    * Cancels the execution of this action.
    */
-  def cancel(): Unit
+  def cancel()
 
   /**
    * Blocks until this action completes.
-   *
    * @param atMost maximum wait time, which may be negative (no waiting is done), Duration.Inf
    *               for unbounded waiting, or a finite positive duration
    * @return this FutureAction
@@ -55,7 +53,6 @@ trait FutureAction[T] extends Future[T] {
 
   /**
    * Awaits and returns the result (of type T) of this action.
-   *
    * @param atMost maximum wait time, which may be negative (no waiting is done), Duration.Inf
    *               for unbounded waiting, or a finite positive duration
    * @throws Exception exception during action execution
@@ -68,7 +65,7 @@ trait FutureAction[T] extends Future[T] {
    * When this action is completed, either through an exception, or a value, applies the provided
    * function.
    */
-  def onComplete[U](func: (Try[T]) => U)(implicit executor: ExecutionContext): Unit
+  def onComplete[U](func: (Try[T]) => U)(implicit executor: ExecutionContext)
 
   /**
    * Returns whether the action has already been completed with a value or an exception.
@@ -92,8 +89,8 @@ trait FutureAction[T] extends Future[T] {
   /**
    * Blocks and returns the result of this job.
    */
-  @throws(classOf[SparkException])
-  def get(): T = ThreadUtils.awaitResult(this, Duration.Inf)
+  @throws(classOf[Exception])
+  def get(): T = Await.result(this, Duration.Inf)
 
   /**
    * Returns the job IDs run by the underlying async operation.

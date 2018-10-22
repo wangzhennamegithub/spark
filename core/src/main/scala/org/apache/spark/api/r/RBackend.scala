@@ -41,9 +41,6 @@ private[spark] class RBackend {
   private[this] var bootstrap: ServerBootstrap = null
   private[this] var bossGroup: EventLoopGroup = null
 
-  /** Tracks JVM objects returned to R for this RBackend instance. */
-  private[r] val jvmObjectTracker = new JVMObjectTracker
-
   def init(): Int = {
     val conf = new SparkConf()
     bossGroup = new NioEventLoopGroup(conf.getInt("spark.r.numRBackendThreads", 2))
@@ -92,14 +89,11 @@ private[spark] class RBackend {
       bootstrap.childGroup().shutdownGracefully()
     }
     bootstrap = null
-    jvmObjectTracker.clear()
   }
 
 }
 
 private[spark] object RBackend extends Logging {
-  initializeLogIfNecessary(true)
-
   def main(args: Array[String]): Unit = {
     if (args.length < 1) {
       // scalastyle:off println
@@ -107,7 +101,6 @@ private[spark] object RBackend extends Logging {
       // scalastyle:on println
       System.exit(-1)
     }
-
     val sparkRBackend = new RBackend()
     try {
       // bind to random port

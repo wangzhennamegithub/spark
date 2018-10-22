@@ -18,16 +18,14 @@
 package org.apache.spark.util
 
 import java.io._
-import java.lang.management.{ManagementFactory, ThreadInfo}
+import java.lang.management.ManagementFactory
 import java.net._
 import java.nio.ByteBuffer
-import java.nio.channels.{Channels, FileChannel}
+import java.nio.channels.Channels
 import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import java.util.{Locale, Properties, Random, UUID}
 import java.util.concurrent._
-import java.util.concurrent.atomic.AtomicBoolean
-import java.util.zip.GZIPInputStream
 import javax.net.ssl.HttpsURLConnection
 
 import scala.annotation.tailrec
@@ -39,7 +37,6 @@ import scala.reflect.ClassTag
 import scala.util.Try
 import scala.util.control.{ControlThrowable, NonFatal}
 
-import com.google.common.cache.{CacheBuilder, CacheLoader, LoadingCache}
 import com.google.common.io.{ByteStreams, Files => GFiles}
 import com.google.common.net.InetAddresses
 import org.apache.commons.lang3.SystemUtils
@@ -54,7 +51,6 @@ import org.slf4j.Logger
 import org.apache.spark._
 import org.apache.spark.deploy.SparkHadoopUtil
 import org.apache.spark.internal.Logging
-import org.apache.spark.internal.config.{DYN_ALLOCATION_INITIAL_EXECUTORS, DYN_ALLOCATION_MIN_EXECUTORS, EXECUTOR_INSTANCES}
 import org.apache.spark.network.util.JavaUtils
 import org.apache.spark.serializer.{DeserializationStream, SerializationStream, SerializerInstance}
 
@@ -82,52 +78,6 @@ private[spark] object Utils extends Logging {
   private val MAX_DIR_CREATION_ATTEMPTS: Int = 10
   @volatile private var localRootDirs: Array[String] = null
 
-  /**
-   * The performance overhead of creating and logging strings for wide schemas can be large. To
-   * limit the impact, we bound the number of fields to include by default. This can be overriden
-   * by setting the 'spark.debug.maxToStringFields' conf in SparkEnv.
-   */
-  val DEFAULT_MAX_TO_STRING_FIELDS = 25
-
-  private def maxNumToStringFields = {
-    if (SparkEnv.get != null) {
-      SparkEnv.get.conf.getInt("spark.debug.maxToStringFields", DEFAULT_MAX_TO_STRING_FIELDS)
-    } else {
-      DEFAULT_MAX_TO_STRING_FIELDS
-    }
-  }
-
-  /** Whether we have warned about plan string truncation yet. */
-  private val truncationWarningPrinted = new AtomicBoolean(false)
-
-  /**
-   * Format a sequence with semantics similar to calling .mkString(). Any elements beyond
-   * maxNumToStringFields will be dropped and replaced by a "... N more fields" placeholder.
-   *
-   * @return the trimmed and formatted string.
-   */
-  def truncatedString[T](
-      seq: Seq[T],
-      start: String,
-      sep: String,
-      end: String,
-      maxNumFields: Int = maxNumToStringFields): String = {
-    if (seq.length > maxNumFields) {
-      if (truncationWarningPrinted.compareAndSet(false, true)) {
-        logWarning(
-          "Truncated the string representation of a plan since it was too large. This " +
-          "behavior can be adjusted by setting 'spark.debug.maxToStringFields' in SparkEnv.conf.")
-      }
-      val numFields = math.max(0, maxNumFields - 1)
-      seq.take(numFields).mkString(
-        start, sep, sep + "... " + (seq.length - numFields) + " more fields" + end)
-    } else {
-      seq.mkString(start, sep, end)
-    }
-  }
-
-  /** Shorthand for calling truncatedString() without start or end strings. */
-  def truncatedString[T](seq: Seq[T], sep: String): String = truncatedString(seq, "", sep, "")
 
   /** Serialize an object using Java serialization */
   def serialize[T](o: T): Array[Byte] = {
@@ -311,22 +261,41 @@ private[spark] object Utils extends Logging {
    * copying is disabled by default unless explicitly set transferToEnabled as true,
    * the parameter transferToEnabled should be configured by spark.file.transferTo = [true|false].
    */
-  def copyStream(
-      in: InputStream,
-      out: OutputStream,
-      closeStreams: Boolean = false,
-      transferToEnabled: Boolean = false): Long = {
+  def copyStream(in: InputStream,
+                 out: OutputStream,
+                 closeStreams: Boolean = false,
+                 transferToEnabled: Boolean = false): Long =
+  {
+    var count = 0L
     tryWithSafeFinally {
       if (in.isInstanceOf[FileInputStream] && out.isInstanceOf[FileOutputStream]
         && transferToEnabled) {
         // When both streams are File stream, use transferTo to improve copy performance.
         val inChannel = in.asInstanceOf[FileInputStream].getChannel()
         val outChannel = out.asInstanceOf[FileOutputStream].getChannel()
+        val initialPos = outChannel.position()
         val size = inChannel.size()
-        copyFileStreamNIO(inChannel, outChannel, 0, size)
-        size
+
+        // In case transferTo method transferred less data than we have required.
+        while (count < size) {
+          count += inChannel.transferTo(count, size - count, outChannel)
+        }
+
+        // Check the position after transferTo loop to see if it is in the right position and
+        // give user information if not.
+        // Position will not be increased to the expected length after calling transferTo in
+        // kernel version 2.6.32, this issue can be seen in
+        // https://bugs.openjdk.java.net/browse/JDK-7052359
+        // This will lead to stream corruption issue when using sort-based shuffle (SPARK-3948).
+        val finalPos = outChannel.position()
+        assert(finalPos == initialPos + size,
+          s"""
+             |Current position $finalPos do not equal to expected position ${initialPos + size}
+             |after transferTo, please check your kernel version to see if it is 2.6.32,
+             |this is a kernel bug which will lead to unexpected behavior when using transferTo.
+             |You can set spark.file.transferTo = false to disable this NIO feature.
+           """.stripMargin)
       } else {
-        var count = 0L
         val buf = new Array[Byte](8192)
         var n = 0
         while (n != -1) {
@@ -336,8 +305,8 @@ private[spark] object Utils extends Logging {
             count += n
           }
         }
-        count
       }
+      count
     } {
       if (closeStreams) {
         try {
@@ -347,37 +316,6 @@ private[spark] object Utils extends Logging {
         }
       }
     }
-  }
-
-  def copyFileStreamNIO(
-      input: FileChannel,
-      output: FileChannel,
-      startPosition: Long,
-      bytesToCopy: Long): Unit = {
-    val initialPos = output.position()
-    var count = 0L
-    // In case transferTo method transferred less data than we have required.
-    while (count < bytesToCopy) {
-      count += input.transferTo(count + startPosition, bytesToCopy - count, output)
-    }
-    assert(count == bytesToCopy,
-      s"request to copy $bytesToCopy bytes, but actually copied $count bytes.")
-
-    // Check the position after transferTo loop to see if it is in the right position and
-    // give user information if not.
-    // Position will not be increased to the expected length after calling transferTo in
-    // kernel version 2.6.32, this issue can be seen in
-    // https://bugs.openjdk.java.net/browse/JDK-7052359
-    // This will lead to stream corruption issue when using sort-based shuffle (SPARK-3948).
-    val finalPos = output.position()
-    val expectedPos = initialPos + bytesToCopy
-    assert(finalPos == expectedPos,
-      s"""
-         |Current position $finalPos do not equal to expected position $expectedPos
-         |after transferTo, please check your kernel version to see if it is 2.6.32,
-         |this is a kernel bug which will lead to unexpected behavior when using transferTo.
-         |You can set spark.file.transferTo = false to disable this NIO feature.
-           """.stripMargin)
   }
 
   /**
@@ -712,26 +650,6 @@ private[spark] object Utils extends Logging {
   }
 
   /**
-   * Validate that a given URI is actually a valid URL as well.
-   * @param uri The URI to validate
-   */
-  @throws[MalformedURLException]("when the URI is an invalid URL")
-  def validateURL(uri: URI): Unit = {
-    Option(uri.getScheme).getOrElse("file") match {
-      case "http" | "https" | "ftp" =>
-        try {
-          uri.toURL
-        } catch {
-          case e: MalformedURLException =>
-            val ex = new MalformedURLException(s"URI (${uri.toString}) is not a valid URL.")
-            ex.initCause(e)
-            throw ex
-        }
-      case _ => // will not be turned into a URL anyway
-    }
-  }
-
-  /**
    * Get the path of a temporary directory.  Spark's local directories can be configured through
    * multiple settings, which are used with the following precedence:
    *
@@ -858,7 +776,7 @@ private[spark] object Utils extends Logging {
    */
   def randomizeInPlace[T](arr: Array[T], rand: Random = new Random): Array[T] = {
     for (i <- (arr.length - 1) to 1 by -1) {
-      val j = rand.nextInt(i + 1)
+      val j = rand.nextInt(i)
       val tmp = arr(j)
       arr(j) = arr(i)
       arr(i) = tmp
@@ -1251,7 +1169,7 @@ private[spark] object Utils extends Logging {
   }
 
   /**
-   * Execute a block of code that evaluates to Unit, stop SparkContext if there is any uncaught
+   * Execute a block of code that evaluates to Unit, stop SparkContext is there is any uncaught
    * exception
    *
    * NOTE: This method is to be called by the driver-side components to avoid stopping the
@@ -1342,35 +1260,26 @@ private[spark] object Utils extends Logging {
   }
 
   /**
-   * Execute a block of code and call the failure callbacks in the catch block. If exceptions occur
-   * in either the catch or the finally block, they are appended to the list of suppressed
-   * exceptions in original exception which is then rethrown.
+   * Execute a block of code, call the failure callbacks before finally block if there is any
+   * exceptions happen. But if exceptions happen in the finally block, do not suppress the original
+   * exception.
    *
-   * This is primarily an issue with `catch { abort() }` or `finally { out.close() }` blocks,
-   * where the abort/close needs to be called to clean up `out`, but if an exception happened
-   * in `out.write`, it's likely `out` may be corrupted and `abort` or `out.close` will
+   * This is primarily an issue with `finally { out.close() }` blocks, where
+   * close needs to be called to clean up `out`, but if an exception happened
+   * in `out.write`, it's likely `out` may be corrupted and `out.close` will
    * fail as well. This would then suppress the original/likely more meaningful
    * exception from the original `out.write` call.
    */
-  def tryWithSafeFinallyAndFailureCallbacks[T](block: => T)
-      (catchBlock: => Unit = (), finallyBlock: => Unit = ()): T = {
+  def tryWithSafeFinallyAndFailureCallbacks[T](block: => T)(finallyBlock: => Unit): T = {
     var originalThrowable: Throwable = null
     try {
       block
     } catch {
-      case cause: Throwable =>
+      case t: Throwable =>
         // Purposefully not using NonFatal, because even fatal exceptions
         // we don't want to have our finallyBlock suppress
-        originalThrowable = cause
-        try {
-          logError("Aborting task", originalThrowable)
-          TaskContext.get().asInstanceOf[TaskContextImpl].markTaskFailed(originalThrowable)
-          catchBlock
-        } catch {
-          case t: Throwable =>
-            originalThrowable.addSuppressed(t)
-            logWarning(s"Suppressing exception in catch: " + t.getMessage, t)
-        }
+        originalThrowable = t
+        TaskContext.get().asInstanceOf[TaskContextImpl].markTaskFailed(t)
         throw originalThrowable
     } finally {
       try {
@@ -1437,12 +1346,8 @@ private[spark] object Utils extends Logging {
             }
             callStack(0) = ste.toString // Put last Spark method on top of the stack trace.
           } else {
-            if (ste.getFileName != null) {
-              firstUserFile = ste.getFileName
-              if (ste.getLineNumber >= 0) {
-                firstUserLine = ste.getLineNumber
-              }
-            }
+            firstUserLine = ste.getLineNumber
+            firstUserFile = ste.getFileName
             callStack += ste.toString
             insideSpark = false
           }
@@ -1466,72 +1371,14 @@ private[spark] object Utils extends Logging {
     CallSite(shortForm, longForm)
   }
 
-  private val UNCOMPRESSED_LOG_FILE_LENGTH_CACHE_SIZE_CONF =
-    "spark.worker.ui.compressedLogFileLengthCacheSize"
-  private val DEFAULT_UNCOMPRESSED_LOG_FILE_LENGTH_CACHE_SIZE = 100
-  private var compressedLogFileLengthCache: LoadingCache[String, java.lang.Long] = null
-  private def getCompressedLogFileLengthCache(
-      sparkConf: SparkConf): LoadingCache[String, java.lang.Long] = this.synchronized {
-    if (compressedLogFileLengthCache == null) {
-      val compressedLogFileLengthCacheSize = sparkConf.getInt(
-        UNCOMPRESSED_LOG_FILE_LENGTH_CACHE_SIZE_CONF,
-        DEFAULT_UNCOMPRESSED_LOG_FILE_LENGTH_CACHE_SIZE)
-      compressedLogFileLengthCache = CacheBuilder.newBuilder()
-        .maximumSize(compressedLogFileLengthCacheSize)
-        .build[String, java.lang.Long](new CacheLoader[String, java.lang.Long]() {
-        override def load(path: String): java.lang.Long = {
-          Utils.getCompressedFileLength(new File(path))
-        }
-      })
-    }
-    compressedLogFileLengthCache
-  }
-
-  /**
-   * Return the file length, if the file is compressed it returns the uncompressed file length.
-   * It also caches the uncompressed file size to avoid repeated decompression. The cache size is
-   * read from workerConf.
-   */
-  def getFileLength(file: File, workConf: SparkConf): Long = {
-    if (file.getName.endsWith(".gz")) {
-      getCompressedLogFileLengthCache(workConf).get(file.getAbsolutePath)
-    } else {
-      file.length
-    }
-  }
-
-  /** Return uncompressed file length of a compressed file. */
-  private def getCompressedFileLength(file: File): Long = {
-    try {
-      // Uncompress .gz file to determine file size.
-      var fileSize = 0L
-      val gzInputStream = new GZIPInputStream(new FileInputStream(file))
-      val bufSize = 1024
-      val buf = new Array[Byte](bufSize)
-      var numBytes = ByteStreams.read(gzInputStream, buf, 0, bufSize)
-      while (numBytes > 0) {
-        fileSize += numBytes
-        numBytes = ByteStreams.read(gzInputStream, buf, 0, bufSize)
-      }
-      fileSize
-    } catch {
-      case e: Throwable =>
-        logError(s"Cannot get file length of ${file}", e)
-        throw e
-    }
-  }
-
   /** Return a string containing part of a file from byte 'start' to 'end'. */
-  def offsetBytes(path: String, length: Long, start: Long, end: Long): String = {
+  def offsetBytes(path: String, start: Long, end: Long): String = {
     val file = new File(path)
+    val length = file.length()
     val effectiveEnd = math.min(length, end)
     val effectiveStart = math.max(0, start)
     val buff = new Array[Byte]((effectiveEnd-effectiveStart).toInt)
-    val stream = if (path.endsWith(".gz")) {
-      new GZIPInputStream(new FileInputStream(file))
-    } else {
-      new FileInputStream(file)
-    }
+    val stream = new FileInputStream(file)
 
     try {
       ByteStreams.skipFully(stream, effectiveStart)
@@ -1547,8 +1394,8 @@ private[spark] object Utils extends Logging {
    * and `endIndex` is based on the cumulative size of all the files take in
    * the given order. See figure below for more details.
    */
-  def offsetBytes(files: Seq[File], fileLengths: Seq[Long], start: Long, end: Long): String = {
-    assert(files.length == fileLengths.length)
+  def offsetBytes(files: Seq[File], start: Long, end: Long): String = {
+    val fileLengths = files.map { _.length }
     val startIndex = math.max(start, 0)
     val endIndex = math.min(end, fileLengths.sum)
     val fileToLength = files.zip(fileLengths).toMap
@@ -1556,7 +1403,7 @@ private[spark] object Utils extends Logging {
 
     val stringBuffer = new StringBuffer((endIndex - startIndex).toInt)
     var sum = 0L
-    files.zip(fileLengths).foreach { case (file, fileLength) =>
+    for (file <- files) {
       val startIndexOfFile = sum
       val endIndexOfFile = sum + fileToLength(file)
       logDebug(s"Processing file $file, " +
@@ -1575,19 +1422,19 @@ private[spark] object Utils extends Logging {
 
       if (startIndex <= startIndexOfFile  && endIndex >= endIndexOfFile) {
         // Case C: read the whole file
-        stringBuffer.append(offsetBytes(file.getAbsolutePath, fileLength, 0, fileToLength(file)))
+        stringBuffer.append(offsetBytes(file.getAbsolutePath, 0, fileToLength(file)))
       } else if (startIndex > startIndexOfFile && startIndex < endIndexOfFile) {
         // Case A and B: read from [start of required range] to [end of file / end of range]
         val effectiveStartIndex = startIndex - startIndexOfFile
         val effectiveEndIndex = math.min(endIndex - startIndexOfFile, fileToLength(file))
         stringBuffer.append(Utils.offsetBytes(
-          file.getAbsolutePath, fileLength, effectiveStartIndex, effectiveEndIndex))
+          file.getAbsolutePath, effectiveStartIndex, effectiveEndIndex))
       } else if (endIndex > startIndexOfFile && endIndex < endIndexOfFile) {
         // Case D: read from [start of file] to [end of require range]
         val effectiveStartIndex = math.max(startIndex - startIndexOfFile, 0)
         val effectiveEndIndex = endIndex - startIndexOfFile
         stringBuffer.append(Utils.offsetBytes(
-          file.getAbsolutePath, fileLength, effectiveStartIndex, effectiveEndIndex))
+          file.getAbsolutePath, effectiveStartIndex, effectiveEndIndex))
       }
       sum += fileToLength(file)
       logDebug(s"After processing file $file, string built is ${stringBuffer.toString}")
@@ -1742,7 +1589,6 @@ private[spark] object Utils extends Logging {
 
   /**
    * Timing method based on iterations that permit JVM JIT optimization.
-   *
    * @param numIters number of iterations
    * @param f function to be executed. If prepare is not None, the running time of each call to f
    *          must be an order of magnitude longer than one millisecond for accurate timing.
@@ -1783,23 +1629,7 @@ private[spark] object Utils extends Logging {
   }
 
   /**
-   * Generate a zipWithIndex iterator, avoid index value overflowing problem
-   * in scala's zipWithIndex
-   */
-  def getIteratorZipWithIndex[T](iterator: Iterator[T], startIndex: Long): Iterator[(T, Long)] = {
-    new Iterator[(T, Long)] {
-      var index: Long = startIndex - 1L
-      def hasNext: Boolean = iterator.hasNext
-      def next(): (T, Long) = {
-        index += 1L
-        (iterator.next(), index)
-      }
-    }
-  }
-
-  /**
    * Creates a symlink.
-   *
    * @param src absolute path to the source
    * @param dst relative path for the destination
    */
@@ -1883,66 +1713,50 @@ private[spark] object Utils extends Logging {
   }
 
   /**
-   * Terminates a process waiting for at most the specified duration.
-   *
-   * @return the process exit value if it was successfully terminated, else None
+   * Terminates a process waiting for at most the specified duration. Returns whether
+   * the process terminated.
    */
   def terminateProcess(process: Process, timeoutMs: Long): Option[Int] = {
-    // Politely destroy first
-    process.destroy()
-
+    try {
+      // Java8 added a new API which will more forcibly kill the process. Use that if available.
+      val destroyMethod = process.getClass().getMethod("destroyForcibly");
+      destroyMethod.setAccessible(true)
+      destroyMethod.invoke(process)
+    } catch {
+      case NonFatal(e) =>
+        if (!e.isInstanceOf[NoSuchMethodException]) {
+          logWarning("Exception when attempting to kill process", e)
+        }
+        process.destroy()
+    }
     if (waitForProcess(process, timeoutMs)) {
-      // Successful exit
       Option(process.exitValue())
     } else {
-      // Java 8 added a new API which will more forcibly kill the process. Use that if available.
-      try {
-        classOf[Process].getMethod("destroyForcibly").invoke(process)
-      } catch {
-        case _: NoSuchMethodException => return None // Not available; give up
-        case NonFatal(e) => logWarning("Exception when attempting to kill process", e)
-      }
-      // Wait, again, although this really should return almost immediately
-      if (waitForProcess(process, timeoutMs)) {
-        Option(process.exitValue())
-      } else {
-        logWarning("Timed out waiting to forcibly kill process")
-        None
-      }
+      None
     }
   }
 
   /**
    * Wait for a process to terminate for at most the specified duration.
-   *
-   * @return whether the process actually terminated before the given timeout.
+   * Return whether the process actually terminated after the given timeout.
    */
   def waitForProcess(process: Process, timeoutMs: Long): Boolean = {
-    try {
-      // Use Java 8 method if available
-      classOf[Process].getMethod("waitFor", java.lang.Long.TYPE, classOf[TimeUnit])
-        .invoke(process, timeoutMs.asInstanceOf[java.lang.Long], TimeUnit.MILLISECONDS)
-        .asInstanceOf[Boolean]
-    } catch {
-      case _: NoSuchMethodException =>
-        // Otherwise implement it manually
-        var terminated = false
-        val startTime = System.currentTimeMillis
-        while (!terminated) {
-          try {
-            process.exitValue()
-            terminated = true
-          } catch {
-            case e: IllegalThreadStateException =>
-              // Process not terminated yet
-              if (System.currentTimeMillis - startTime > timeoutMs) {
-                return false
-              }
-              Thread.sleep(100)
+    var terminated = false
+    val startTime = System.currentTimeMillis
+    while (!terminated) {
+      try {
+        process.exitValue()
+        terminated = true
+      } catch {
+        case e: IllegalThreadStateException =>
+          // Process not terminated yet
+          if (System.currentTimeMillis - startTime > timeoutMs) {
+            return false
           }
-        }
-        true
+          Thread.sleep(100)
+      }
     }
+    true
   }
 
   /**
@@ -1992,11 +1806,7 @@ private[spark] object Utils extends Logging {
   /** Returns true if the given exception was fatal. See docs for scala.util.control.NonFatal. */
   def isFatalError(e: Throwable): Boolean = {
     e match {
-      case NonFatal(_) |
-           _: InterruptedException |
-           _: NotImplementedError |
-           _: ControlThrowable |
-           _: LinkageError =>
+      case NonFatal(_) | _: InterruptedException | _: NotImplementedError | _: ControlThrowable =>
         false
       case _ =>
         true
@@ -2123,27 +1933,11 @@ private[spark] object Utils extends Logging {
     // We need to filter out null values here because dumpAllThreads() may return null array
     // elements for threads that are dead / don't exist.
     val threadInfos = ManagementFactory.getThreadMXBean.dumpAllThreads(true, true).filter(_ != null)
-    threadInfos.sortBy(_.getThreadId).map(threadInfoToThreadStackTrace)
-  }
-
-  def getThreadDumpForThread(threadId: Long): Option[ThreadStackTrace] = {
-    if (threadId <= 0) {
-      None
-    } else {
-      // The Int.MaxValue here requests the entire untruncated stack trace of the thread:
-      val threadInfo =
-        Option(ManagementFactory.getThreadMXBean.getThreadInfo(threadId, Int.MaxValue))
-      threadInfo.map(threadInfoToThreadStackTrace)
+    threadInfos.sortBy(_.getThreadId).map { case threadInfo =>
+      val stackTrace = threadInfo.getStackTrace.map(_.toString).mkString("\n")
+      ThreadStackTrace(threadInfo.getThreadId, threadInfo.getThreadName,
+        threadInfo.getThreadState, stackTrace)
     }
-  }
-
-  private def threadInfoToThreadStackTrace(threadInfo: ThreadInfo): ThreadStackTrace = {
-    val stackTrace = threadInfo.getStackTrace.map(_.toString).mkString("\n")
-    ThreadStackTrace(
-      threadId = threadInfo.getThreadId,
-      threadName = threadInfo.getThreadName,
-      threadState = threadInfo.getThreadState,
-      stackTrace = stackTrace)
   }
 
   /**
@@ -2376,25 +2170,6 @@ private[spark] object Utils extends Logging {
       .getOrElse(UserGroupInformation.getCurrentUser().getShortUserName())
   }
 
-  val EMPTY_USER_GROUPS = Set[String]()
-
-  // Returns the groups to which the current user belongs.
-  def getCurrentUserGroups(sparkConf: SparkConf, username: String): Set[String] = {
-    val groupProviderClassName = sparkConf.get("spark.user.groups.mapping",
-      "org.apache.spark.security.ShellBasedGroupsMappingProvider")
-    if (groupProviderClassName != "") {
-      try {
-        val groupMappingServiceProvider = classForName(groupProviderClassName).newInstance.
-          asInstanceOf[org.apache.spark.security.GroupMappingServiceProvider]
-        val currentUserGroups = groupMappingServiceProvider.getGroups(username)
-        return currentUserGroups
-      } catch {
-        case e: Exception => logError(s"Error getting groups for user=$username", e)
-      }
-    }
-    EMPTY_USER_GROUPS
-  }
-
   /**
    * Split the comma delimited string of master URLs into a list.
    * For instance, "spark://abc,def" becomes [spark://abc, spark://def].
@@ -2457,39 +2232,19 @@ private[spark] object Utils extends Logging {
   }
 
   /**
-   * Return whether dynamic allocation is enabled in the given conf.
+   * Return whether dynamic allocation is enabled in the given conf
+   * Dynamic allocation and explicitly setting the number of executors are inherently
+   * incompatible. In environments where dynamic allocation is turned on by default,
+   * the latter should override the former (SPARK-9092).
    */
   def isDynamicAllocationEnabled(conf: SparkConf): Boolean = {
+    val numExecutor = conf.getInt("spark.executor.instances", 0)
     val dynamicAllocationEnabled = conf.getBoolean("spark.dynamicAllocation.enabled", false)
-    dynamicAllocationEnabled &&
+    if (numExecutor != 0 && dynamicAllocationEnabled) {
+      logWarning("Dynamic Allocation and num executors both set, thus dynamic allocation disabled.")
+    }
+    numExecutor == 0 && dynamicAllocationEnabled &&
       (!isLocalMaster(conf) || conf.getBoolean("spark.dynamicAllocation.testing", false))
-  }
-
-  /**
-   * Return the initial number of executors for dynamic allocation.
-   */
-  def getDynamicAllocationInitialExecutors(conf: SparkConf): Int = {
-    if (conf.get(DYN_ALLOCATION_INITIAL_EXECUTORS) < conf.get(DYN_ALLOCATION_MIN_EXECUTORS)) {
-      logWarning(s"${DYN_ALLOCATION_INITIAL_EXECUTORS.key} less than " +
-        s"${DYN_ALLOCATION_MIN_EXECUTORS.key} is invalid, ignoring its setting, " +
-          "please update your configs.")
-    }
-
-    if (conf.get(EXECUTOR_INSTANCES).getOrElse(0) < conf.get(DYN_ALLOCATION_MIN_EXECUTORS)) {
-      logWarning(s"${EXECUTOR_INSTANCES.key} less than " +
-        s"${DYN_ALLOCATION_MIN_EXECUTORS.key} is invalid, ignoring its setting, " +
-          "please update your configs.")
-    }
-
-    val initialExecutors = Seq(
-      conf.get(DYN_ALLOCATION_MIN_EXECUTORS),
-      conf.get(DYN_ALLOCATION_INITIAL_EXECUTORS),
-      conf.get(EXECUTOR_INSTANCES).getOrElse(0)).max
-
-    logInfo(s"Using initial executors = $initialExecutors, max of " +
-      s"${DYN_ALLOCATION_INITIAL_EXECUTORS.key}, ${DYN_ALLOCATION_MIN_EXECUTORS.key} and " +
-        s"${EXECUTOR_INSTANCES.key}")
-    initialExecutors
   }
 
   def tryWithResource[R <: Closeable, T](createResource: => R)(f: R => T): T = {
@@ -2518,32 +2273,7 @@ private[spark] object Utils extends Logging {
    */
   def initDaemon(log: Logger): Unit = {
     log.info(s"Started daemon with process name: ${Utils.getProcessName()}")
-    SignalUtils.registerLogger(log)
-  }
-
-  /**
-   * Unions two comma-separated lists of files and filters out empty strings.
-   */
-  def unionFileLists(leftList: Option[String], rightList: Option[String]): Set[String] = {
-    var allFiles = Set[String]()
-    leftList.foreach { value => allFiles ++= value.split(",") }
-    rightList.foreach { value => allFiles ++= value.split(",") }
-    allFiles.filter { _.nonEmpty }
-  }
-
-  /**
-   * In YARN mode this method returns a union of the jar files pointed by "spark.jars" and the
-   * "spark.yarn.dist.jars" properties, while in other modes it returns the jar files pointed by
-   * only the "spark.jars" property.
-   */
-  def getUserJars(conf: SparkConf, isShell: Boolean = false): Seq[String] = {
-    val sparkJars = conf.getOption("spark.jars")
-    if (conf.get("spark.master") == "yarn" && isShell) {
-      val yarnJars = conf.getOption("spark.yarn.dist.jars")
-      unionFileLists(sparkJars, yarnJars).toSeq
-    } else {
-      sparkJars.map(_.split(",")).map(_.filter(_.nonEmpty)).toSeq.flatten
-    }
+    SignalLogger.register(log)
   }
 }
 
@@ -2584,24 +2314,29 @@ private[spark] class RedirectThread(
  * the toString method.
  */
 private[spark] class CircularBuffer(sizeInBytes: Int = 10240) extends java.io.OutputStream {
-  private var pos: Int = 0
-  private var isBufferFull = false
-  private val buffer = new Array[Byte](sizeInBytes)
+  var pos: Int = 0
+  var buffer = new Array[Int](sizeInBytes)
 
-  def write(input: Int): Unit = {
-    buffer(pos) = input.toByte
+  def write(i: Int): Unit = {
+    buffer(pos) = i
     pos = (pos + 1) % buffer.length
-    isBufferFull = isBufferFull || (pos == 0)
   }
 
   override def toString: String = {
-    if (!isBufferFull) {
-      return new String(buffer, 0, pos, StandardCharsets.UTF_8)
-    }
+    val (end, start) = buffer.splitAt(pos)
+    val input = new java.io.InputStream {
+      val iterator = (start ++ end).iterator
 
-    val nonCircularBuffer = new Array[Byte](sizeInBytes)
-    System.arraycopy(buffer, pos, nonCircularBuffer, 0, buffer.length - pos)
-    System.arraycopy(buffer, 0, nonCircularBuffer, buffer.length - pos, pos)
-    new String(nonCircularBuffer, StandardCharsets.UTF_8)
+      def read(): Int = if (iterator.hasNext) iterator.next() else -1
+    }
+    val reader = new BufferedReader(new InputStreamReader(input, StandardCharsets.UTF_8))
+    val stringBuilder = new StringBuilder
+    var line = reader.readLine()
+    while (line != null) {
+      stringBuilder.append(line)
+      stringBuilder.append("\n")
+      line = reader.readLine()
+    }
+    stringBuilder.toString()
   }
 }

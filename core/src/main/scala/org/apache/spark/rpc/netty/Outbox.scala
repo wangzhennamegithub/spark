@@ -241,7 +241,10 @@ private[netty] class Outbox(nettyEnv: NettyRpcEnv, val address: RpcAddress) {
   }
 
   private def closeClient(): Unit = synchronized {
-    // Just set client to null. Don't close it in order to reuse the connection.
+    // Not sure if `client.close` is idempotent. Just for safety.
+    if (client != null) {
+      client.close()
+    }
     client = null
   }
 

@@ -121,10 +121,11 @@ private[spark] class ZookeeperMesosClusterPersistenceEngine(
       Some(Utils.deserialize[T](fileData))
     } catch {
       case e: NoNodeException => None
-      case e: Exception =>
+      case e: Exception => {
         logWarning("Exception while reading persisted file, deleting", e)
         zk.delete().forPath(zkPath)
         None
+      }
     }
   }
 

@@ -470,7 +470,7 @@ private[spark] object PythonRDD extends Logging {
           objs.append(obj)
         }
       } catch {
-        case eof: EOFException => // No-op
+        case eof: EOFException => {}
       }
       JavaRDD.fromRDD(sc.sc.parallelize(objs, parallelism))
     } finally {
@@ -678,7 +678,7 @@ private[spark] object PythonRDD extends Logging {
    * Create a socket server and a background thread to serve the data in `items`,
    *
    * The socket server can only accept one connection, or close if no connection
-   * in 15 seconds.
+   * in 3 seconds.
    *
    * Once a connection comes in, it tries to serialize all the data in `items`
    * and send them into this connection.
@@ -687,8 +687,8 @@ private[spark] object PythonRDD extends Logging {
    */
   def serveIterator[T](items: Iterator[T], threadName: String): Int = {
     val serverSocket = new ServerSocket(0, 1, InetAddress.getByName("localhost"))
-    // Close the socket if no connection in 15 seconds
-    serverSocket.setSoTimeout(15000)
+    // Close the socket if no connection in 3 seconds
+    serverSocket.setSoTimeout(3000)
 
     new Thread(threadName) {
       setDaemon(true)
@@ -919,7 +919,7 @@ private class PythonAccumulatorParam(@transient private val serverHost: String, 
 }
 
 /**
- * A Wrapper for Python Broadcast, which is written into disk by Python. It also will
+ * An Wrapper for Python Broadcast, which is written into disk by Python. It also will
  * write the data into disk after deserialization, then Python can read it from disks.
  */
 // scalastyle:off no.finalize

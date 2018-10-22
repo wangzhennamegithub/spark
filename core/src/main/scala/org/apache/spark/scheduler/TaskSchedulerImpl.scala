@@ -33,22 +33,21 @@ import org.apache.spark.TaskState.TaskState
 import org.apache.spark.internal.Logging
 import org.apache.spark.scheduler.SchedulingMode.SchedulingMode
 import org.apache.spark.scheduler.TaskLocality.TaskLocality
-import org.apache.spark.scheduler.local.LocalSchedulerBackend
 import org.apache.spark.storage.BlockManagerId
-import org.apache.spark.util.{AccumulatorV2, ThreadUtils, Utils}
+import org.apache.spark.util.{ThreadUtils, Utils}
 
 /**
  * Schedules tasks for multiple types of clusters by acting through a SchedulerBackend.
- * It can also work with a local setup by using a [[LocalSchedulerBackend]] and setting
- * isLocal to true. It handles common logic, like determining a scheduling order across jobs, waking
- * up to launch speculative tasks, etc.
+ * It can also work with a local setup by using a LocalBackend and setting isLocal to true.
+ * It handles common logic, like determining a scheduling order across jobs, waking up to launch
+ * speculative tasks, etc.
  *
  * Clients should first call initialize() and start(), then submit task sets through the
  * runTasks method.
  *
- * THREADING: [[SchedulerBackend]]s and task-submitting clients can call this class from multiple
+ * THREADING: SchedulerBackends and task-submitting clients can call this class from multiple
  * threads, so it needs locks in public API methods to maintain its state. In addition, some
- * [[SchedulerBackend]]s synchronize on themselves when they want to send events here, and then
+ * SchedulerBackends synchronize on themselves when they want to send events here, and then
  * acquire a lock on us, so we need to make sure that we don't try to lock the backend while
  * we are holding a lock on ourselves.
  */
@@ -88,12 +87,10 @@ private[spark] class TaskSchedulerImpl(
   // Incrementing task IDs
   val nextTaskId = new AtomicLong(0)
 
-  // IDs of the tasks running on each executor
-  private val executorIdToRunningTaskIds = new HashMap[String, HashSet[Long]]
+  // Number of tasks running on each executor
+  private val executorIdToTaskCount = new HashMap[String, Int]
 
-  def runningTasksByExecutors: Map[String, Int] = synchronized {
-    executorIdToRunningTaskIds.toMap.mapValues(_.size)
-  }
+  def runningTasksByExecutors(): Map[String, Int] = executorIdToTaskCount.toMap
 
   // The set of executors we have on each host; this is used to compute hostsAlive, which
   // in turn is used to decide when we can attain data locality on a given host
@@ -138,8 +135,6 @@ private[spark] class TaskSchedulerImpl(
           new FIFOSchedulableBuilder(rootPool)
         case SchedulingMode.FAIR =>
           new FairSchedulableBuilder(rootPool, conf)
-        case _ =>
-          throw new IllegalArgumentException(s"Unsupported spark.scheduler.mode: $schedulingMode")
       }
     }
     schedulableBuilder.buildPools()
@@ -261,7 +256,7 @@ private[spark] class TaskSchedulerImpl(
             val tid = task.taskId
             taskIdToTaskSetManager(tid) = taskSet
             taskIdToExecutorId(tid) = execId
-            executorIdToRunningTaskIds(execId).add(tid)
+            executorIdToTaskCount(execId) += 1
             executorsByHost(host) += execId
             availableCpus(i) -= CPUS_PER_TASK
             assert(availableCpus(i) >= 0)
@@ -290,7 +285,7 @@ private[spark] class TaskSchedulerImpl(
     var newExecAvail = false
     for (o <- offers) {
       executorIdToHost(o.executorId) = o.host
-      executorIdToRunningTaskIds.getOrElseUpdate(o.executorId, HashSet[Long]())
+      executorIdToTaskCount.getOrElseUpdate(o.executorId, 0)
       if (!executorsByHost.contains(o.host)) {
         executorsByHost(o.host) = new HashSet[String]()
         executorAdded(o.executorId, o.host)
@@ -334,37 +329,39 @@ private[spark] class TaskSchedulerImpl(
 
   def statusUpdate(tid: Long, state: TaskState, serializedData: ByteBuffer) {
     var failedExecutor: Option[String] = None
-    var reason: Option[ExecutorLossReason] = None
     synchronized {
       try {
+        if (state == TaskState.LOST && taskIdToExecutorId.contains(tid)) {
+          // We lost this entire executor, so remember that it's gone
+          val execId = taskIdToExecutorId(tid)
+
+          if (executorIdToTaskCount.contains(execId)) {
+            removeExecutor(execId,
+              SlaveLost(s"Task $tid was lost, so marking the executor as lost as well."))
+            failedExecutor = Some(execId)
+          }
+        }
         taskIdToTaskSetManager.get(tid) match {
           case Some(taskSet) =>
-            if (state == TaskState.LOST) {
-              // TaskState.LOST is only used by the deprecated Mesos fine-grained scheduling mode,
-              // where each executor corresponds to a single task, so mark the executor as failed.
-              val execId = taskIdToExecutorId.getOrElse(tid, throw new IllegalStateException(
-                "taskIdToTaskSetManager.contains(tid) <=> taskIdToExecutorId.contains(tid)"))
-              if (executorIdToRunningTaskIds.contains(execId)) {
-                reason = Some(
-                  SlaveLost(s"Task $tid was lost, so marking the executor as lost as well."))
-                removeExecutor(execId, reason.get)
-                failedExecutor = Some(execId)
+            if (TaskState.isFinished(state)) {
+              taskIdToTaskSetManager.remove(tid)
+              taskIdToExecutorId.remove(tid).foreach { execId =>
+                if (executorIdToTaskCount.contains(execId)) {
+                  executorIdToTaskCount(execId) -= 1
+                }
               }
             }
-            if (TaskState.isFinished(state)) {
-              cleanupTaskState(tid)
+            if (state == TaskState.FINISHED) {
               taskSet.removeRunningTask(tid)
-              if (state == TaskState.FINISHED) {
-                taskResultGetter.enqueueSuccessfulTask(taskSet, tid, serializedData)
-              } else if (Set(TaskState.FAILED, TaskState.KILLED, TaskState.LOST).contains(state)) {
-                taskResultGetter.enqueueFailedTask(taskSet, tid, state, serializedData)
-              }
+              taskResultGetter.enqueueSuccessfulTask(taskSet, tid, serializedData)
+            } else if (Set(TaskState.FAILED, TaskState.KILLED, TaskState.LOST).contains(state)) {
+              taskSet.removeRunningTask(tid)
+              taskResultGetter.enqueueFailedTask(taskSet, tid, state, serializedData)
             }
           case None =>
             logError(
               ("Ignoring update with state %s for TID %s because its task set is gone (this is " +
-                "likely the result of receiving duplicate task finished status updates) or its " +
-                "executor has been marked as failed.")
+                "likely the result of receiving duplicate task finished status updates)")
                 .format(state, tid))
         }
       } catch {
@@ -373,8 +370,7 @@ private[spark] class TaskSchedulerImpl(
     }
     // Update the DAGScheduler without holding a lock on this, since that can deadlock
     if (failedExecutor.isDefined) {
-      assert(reason.isDefined)
-      dagScheduler.executorLost(failedExecutor.get, reason.get)
+      dagScheduler.executorLost(failedExecutor.get)
       backend.reviveOffers()
     }
   }
@@ -386,14 +382,13 @@ private[spark] class TaskSchedulerImpl(
    */
   override def executorHeartbeatReceived(
       execId: String,
-      accumUpdates: Array[(Long, Seq[AccumulatorV2[_, _]])],
+      accumUpdates: Array[(Long, Seq[AccumulableInfo])],
       blockManagerId: BlockManagerId): Boolean = {
     // (taskId, stageId, stageAttemptId, accumUpdates)
     val accumUpdatesWithTaskIds: Array[(Long, Int, Int, Seq[AccumulableInfo])] = synchronized {
       accumUpdates.flatMap { case (id, updates) =>
-        val accInfos = updates.map(acc => acc.toInfo(Some(acc.value), None))
         taskIdToTaskSetManager.get(id).map { taskSetMgr =>
-          (id, taskSetMgr.stageId, taskSetMgr.taskSet.stageAttemptId, accInfos)
+          (id, taskSetMgr.stageId, taskSetMgr.taskSet.stageAttemptId, updates)
         }
       }
     }
@@ -475,7 +470,7 @@ private[spark] class TaskSchedulerImpl(
     var failedExecutor: Option[String] = None
 
     synchronized {
-      if (executorIdToRunningTaskIds.contains(executorId)) {
+      if (executorIdToTaskCount.contains(executorId)) {
         val hostPort = executorIdToHost(executorId)
         logExecutorLoss(executorId, hostPort, reason)
         removeExecutor(executorId, reason)
@@ -500,7 +495,7 @@ private[spark] class TaskSchedulerImpl(
     }
     // Call dagScheduler.executorLost without holding the lock on this to prevent deadlock
     if (failedExecutor.isDefined) {
-      dagScheduler.executorLost(failedExecutor.get, reason)
+      dagScheduler.executorLost(failedExecutor.get)
       backend.reviveOffers()
     }
   }
@@ -518,30 +513,12 @@ private[spark] class TaskSchedulerImpl(
   }
 
   /**
-   * Cleans up the TaskScheduler's state for tracking the given task.
-   */
-  private def cleanupTaskState(tid: Long): Unit = {
-    taskIdToTaskSetManager.remove(tid)
-    taskIdToExecutorId.remove(tid).foreach { executorId =>
-      executorIdToRunningTaskIds.get(executorId).foreach { _.remove(tid) }
-    }
-  }
-
-  /**
    * Remove an executor from all our data structures and mark it as lost. If the executor's loss
    * reason is not yet known, do not yet remove its association with its host nor update the status
    * of any running tasks, since the loss reason defines whether we'll fail those tasks.
    */
   private def removeExecutor(executorId: String, reason: ExecutorLossReason) {
-    // The tasks on the lost executor may not send any more status updates (because the executor
-    // has been lost), so they should be cleaned up here.
-    executorIdToRunningTaskIds.remove(executorId).foreach { taskIds =>
-      logDebug("Cleaning up TaskScheduler state for tasks " +
-        s"${taskIds.mkString("[", ",", "]")} on failed executor $executorId")
-      // We do not notify the TaskSetManager of the task failures because that will
-      // happen below in the rootPool.executorLost() call.
-      taskIds.foreach(cleanupTaskState)
-    }
+    executorIdToTaskCount -= executorId
 
     val host = executorIdToHost(executorId)
     val execs = executorsByHost.getOrElse(host, new HashSet)
@@ -579,11 +556,11 @@ private[spark] class TaskSchedulerImpl(
   }
 
   def isExecutorAlive(execId: String): Boolean = synchronized {
-    executorIdToRunningTaskIds.contains(execId)
+    executorIdToTaskCount.contains(execId)
   }
 
   def isExecutorBusy(execId: String): Boolean = synchronized {
-    executorIdToRunningTaskIds.get(execId).exists(_.nonEmpty)
+    executorIdToTaskCount.getOrElse(execId, -1) > 0
   }
 
   // By default, rack is unknown
@@ -594,11 +571,6 @@ private[spark] class TaskSchedulerImpl(
       return
     }
     while (!backend.isReady) {
-      // Might take a while for backend to be ready if it is waiting on resources.
-      if (sc.stopped.get) {
-        // For example: the master removes the application for some reason
-        throw new IllegalStateException("Spark context stopped while waiting for backend")
-      }
       synchronized {
         this.wait(100)
       }

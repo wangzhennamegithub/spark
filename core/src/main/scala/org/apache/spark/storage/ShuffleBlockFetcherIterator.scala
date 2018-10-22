@@ -108,7 +108,7 @@ final class ShuffleBlockFetcherIterator(
   /** Current number of requests in flight */
   private[this] var reqsInFlight = 0
 
-  private[this] val shuffleMetrics = context.taskMetrics().createTempShuffleReadMetrics()
+  private[this] val shuffleMetrics = context.taskMetrics().registerTempShuffleReadMetrics()
 
   /**
    * Whether the iterator is still active. If isZombie is true, the callback interface will no
@@ -143,12 +143,13 @@ final class ShuffleBlockFetcherIterator(
     while (iter.hasNext) {
       val result = iter.next()
       result match {
-        case SuccessFetchResult(_, address, _, buf, _) =>
+        case SuccessFetchResult(_, address, _, buf, _) => {
           if (address != blockManager.blockManagerId) {
             shuffleMetrics.incRemoteBytesRead(buf.size)
             shuffleMetrics.incRemoteBlocksFetched(1)
           }
           buf.release()
+        }
         case _ =>
       }
     }
@@ -304,10 +305,6 @@ final class ShuffleBlockFetcherIterator(
    * Throws a FetchFailedException if the next block could not be fetched.
    */
   override def next(): (BlockId, InputStream) = {
-    if (!hasNext) {
-      throw new NoSuchElementException
-    }
-
     numBlocksProcessed += 1
     val startFetchWait = System.currentTimeMillis()
     currentResult = results.take()
@@ -316,7 +313,7 @@ final class ShuffleBlockFetcherIterator(
     shuffleMetrics.incFetchWaitTime(stopFetchWait - startFetchWait)
 
     result match {
-      case SuccessFetchResult(_, address, size, buf, isNetworkReqDone) =>
+      case SuccessFetchResult(_, address, size, buf, isNetworkReqDone) => {
         if (address != blockManager.blockManagerId) {
           shuffleMetrics.incRemoteBytesRead(buf.size)
           shuffleMetrics.incRemoteBlocksFetched(1)
@@ -326,6 +323,7 @@ final class ShuffleBlockFetcherIterator(
           reqsInFlight -= 1
           logDebug("Number of requests in flight " + reqsInFlight)
         }
+      }
       case _ =>
     }
     // Send fetch requests up to maxBytesInFlight

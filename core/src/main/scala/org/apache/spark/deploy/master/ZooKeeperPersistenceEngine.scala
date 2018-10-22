@@ -70,10 +70,11 @@ private[master] class ZooKeeperPersistenceEngine(conf: SparkConf, val serializer
     try {
       Some(serializer.newInstance().deserialize[T](ByteBuffer.wrap(fileData)))
     } catch {
-      case e: Exception =>
+      case e: Exception => {
         logWarning("Exception while reading persisted file, deleting", e)
         zk.delete().forPath(WORKING_DIR + "/" + filename)
         None
+      }
     }
   }
 }

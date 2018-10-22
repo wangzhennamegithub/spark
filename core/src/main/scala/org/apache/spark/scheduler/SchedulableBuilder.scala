@@ -34,9 +34,9 @@ import org.apache.spark.util.Utils
 private[spark] trait SchedulableBuilder {
   def rootPool: Pool
 
-  def buildPools(): Unit
+  def buildPools()
 
-  def addTaskSetManager(manager: Schedulable, properties: Properties): Unit
+  def addTaskSetManager(manager: Schedulable, properties: Properties)
 }
 
 private[spark] class FIFOSchedulableBuilder(val rootPool: Pool)
@@ -112,8 +112,7 @@ private[spark] class FairSchedulableBuilder(val rootPool: Pool, conf: SparkConf)
           schedulingMode = SchedulingMode.withName(xmlSchedulingMode)
         } catch {
           case e: NoSuchElementException =>
-            logWarning(s"Unsupported schedulingMode: $xmlSchedulingMode, " +
-              s"using the default schedulingMode: $schedulingMode")
+            logWarning("Error xml schedulingMode, using default schedulingMode")
         }
       }
 

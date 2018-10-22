@@ -29,6 +29,9 @@ import org.apache.spark.{ShuffleDependency, TaskContext}
  */
 private[spark] trait ShuffleManager {
 
+  /** Return short name for the ShuffleManager */
+  val shortName: String
+
   /**
    * Register a shuffle with the manager and obtain a handle for it to pass to tasks.
    */

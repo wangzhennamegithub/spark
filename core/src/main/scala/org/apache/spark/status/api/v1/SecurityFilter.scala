@@ -16,19 +16,21 @@
  */
 package org.apache.spark.status.api.v1
 
-import javax.ws.rs.container.{ContainerRequestContext, ContainerRequestFilter}
+import javax.ws.rs.WebApplicationException
 import javax.ws.rs.core.Response
-import javax.ws.rs.ext.Provider
 
-@Provider
-private[v1] class SecurityFilter extends ContainerRequestFilter with ApiRequestContext {
-  override def filter(req: ContainerRequestContext): Unit = {
-    val user = httpRequest.getRemoteUser()
-    if (!uiRoot.securityManager.checkUIViewPermissions(user)) {
-      req.abortWith(
+import com.sun.jersey.spi.container.{ContainerRequest, ContainerRequestFilter}
+
+private[v1] class SecurityFilter extends ContainerRequestFilter with UIRootFromServletContext {
+  def filter(req: ContainerRequest): ContainerRequest = {
+    val user = Option(req.getUserPrincipal).map { _.getName }.orNull
+    if (uiRoot.securityManager.checkUIViewPermissions(user)) {
+      req
+    } else {
+      throw new WebApplicationException(
         Response
           .status(Response.Status.FORBIDDEN)
-          .entity(raw"""user "$user" is not authorized""")
+          .entity(raw"""user "$user"is not authorized""")
           .build()
       )
     }

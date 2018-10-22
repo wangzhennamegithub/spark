@@ -90,13 +90,23 @@ private[spark] abstract class WebUI(
   /** Attach a handler to this UI. */
   def attachHandler(handler: ServletContextHandler) {
     handlers += handler
-    serverInfo.foreach(_.addHandler(handler))
+    serverInfo.foreach { info =>
+      info.rootHandler.addHandler(handler)
+      if (!handler.isStarted) {
+        handler.start()
+      }
+    }
   }
 
   /** Detach a handler from this UI. */
   def detachHandler(handler: ServletContextHandler) {
     handlers -= handler
-    serverInfo.foreach(_.removeHandler(handler))
+    serverInfo.foreach { info =>
+      info.rootHandler.removeHandler(handler)
+      if (handler.isStarted) {
+        handler.stop()
+      }
+    }
   }
 
   /**
@@ -119,24 +129,22 @@ private[spark] abstract class WebUI(
   }
 
   /** Initialize all components of the server. */
-  def initialize(): Unit
+  def initialize()
 
   /** Bind to the HTTP server behind this web interface. */
   def bind() {
-    assert(!serverInfo.isDefined, s"Attempted to bind $className more than once!")
+    assert(!serverInfo.isDefined, "Attempted to bind %s more than once!".format(className))
     try {
-      val host = Option(conf.getenv("SPARK_LOCAL_IP")).getOrElse("0.0.0.0")
+      var host = Option(conf.getenv("SPARK_LOCAL_IP")).getOrElse("0.0.0.0")
       serverInfo = Some(startJettyServer(host, port, sslOptions, handlers, conf, name))
-      logInfo(s"Bound $className to $host, and started at $webUrl")
+      logInfo("Bound %s to %s, and started at http://%s:%d".format(className, host,
+        publicHostName, boundPort))
     } catch {
       case e: Exception =>
-        logError(s"Failed to bind $className", e)
+        logError("Failed to bind %s".format(className), e)
         System.exit(1)
     }
   }
-
-  /** Return the url of web interface. Only valid after bind(). */
-  def webUrl: String = s"http://$publicHostName:$boundPort"
 
   /** Return the actual port to which this server is bound. Only valid after bind(). */
   def boundPort: Int = serverInfo.map(_.boundPort).getOrElse(-1)
@@ -144,8 +152,8 @@ private[spark] abstract class WebUI(
   /** Stop the server behind this web interface. Only valid after bind(). */
   def stop() {
     assert(serverInfo.isDefined,
-      s"Attempted to stop $className before binding to a server!")
-    serverInfo.get.stop()
+      "Attempted to stop %s before binding to a server!".format(className))
+    serverInfo.get.server.stop()
   }
 }
 

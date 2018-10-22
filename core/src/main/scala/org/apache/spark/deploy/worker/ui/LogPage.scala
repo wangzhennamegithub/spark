@@ -20,9 +20,7 @@ package org.apache.spark.deploy.worker.ui
 import java.io.File
 import javax.servlet.http.HttpServletRequest
 
-import scala.xml.{Node, Unparsed}
-
-import com.google.common.cache.{CacheBuilder, CacheLoader, LoadingCache}
+import scala.xml.Node
 
 import org.apache.spark.internal.Logging
 import org.apache.spark.ui.{UIUtils, WebUIPage}
@@ -33,9 +31,10 @@ private[ui] class LogPage(parent: WorkerWebUI) extends WebUIPage("logPage") with
   private val worker = parent.worker
   private val workDir = new File(parent.workDir.toURI.normalize().getPath)
   private val supportedLogTypes = Set("stderr", "stdout")
-  private val defaultBytes = 100 * 1024
 
   def renderLog(request: HttpServletRequest): String = {
+    val defaultBytes = 100 * 1024
+
     val appId = Option(request.getParameter("appId"))
     val executorId = Option(request.getParameter("executorId"))
     val driverId = Option(request.getParameter("driverId"))
@@ -45,9 +44,9 @@ private[ui] class LogPage(parent: WorkerWebUI) extends WebUIPage("logPage") with
 
     val logDir = (appId, executorId, driverId) match {
       case (Some(a), Some(e), None) =>
-        s"${workDir.getPath}/$a/$e/"
+        s"${workDir.getPath}/$appId/$executorId/"
       case (None, None, Some(d)) =>
-        s"${workDir.getPath}/$d/"
+        s"${workDir.getPath}/$driverId/"
       case _ =>
         throw new Exception("Request must specify either application or driver identifiers")
     }
@@ -58,6 +57,7 @@ private[ui] class LogPage(parent: WorkerWebUI) extends WebUIPage("logPage") with
   }
 
   def render(request: HttpServletRequest): Seq[Node] = {
+    val defaultBytes = 100 * 1024
     val appId = Option(request.getParameter("appId"))
     val executorId = Option(request.getParameter("executorId"))
     val driverId = Option(request.getParameter("driverId"))
@@ -76,44 +76,51 @@ private[ui] class LogPage(parent: WorkerWebUI) extends WebUIPage("logPage") with
 
     val (logText, startByte, endByte, logLength) = getLog(logDir, logType, offset, byteLength)
     val linkToMaster = <p><a href={worker.activeMasterWebUiUrl}>Back to Master</a></p>
-    val curLogLength = endByte - startByte
-    val range =
-      <span id="log-data">
-        Showing {curLogLength} Bytes: {startByte.toString} - {endByte.toString} of {logLength}
-      </span>
+    val range = <span>Bytes {startByte.toString} - {endByte.toString} of {logLength}</span>
 
-    val moreButton =
-      <button type="button" onclick={"loadMore()"} class="log-more-btn btn btn-default">
-        Load More
-      </button>
+    val backButton =
+      if (startByte > 0) {
+        <a href={"?%s&logType=%s&offset=%s&byteLength=%s"
+          .format(params, logType, math.max(startByte - byteLength, 0), byteLength)}>
+          <button type="button" class="btn btn-default">
+            Previous {Utils.bytesToString(math.min(byteLength, startByte))}
+          </button>
+        </a>
+      } else {
+        <button type="button" class="btn btn-default" disabled="disabled">
+          Previous 0 B
+        </button>
+      }
 
-    val newButton =
-      <button type="button" onclick={"loadNew()"} class="log-new-btn btn btn-default">
-        Load New
-      </button>
-
-    val alert =
-      <div class="no-new-alert alert alert-info" style="display: none;">
-        End of Log
-      </div>
-
-    val logParams = "?%s&logType=%s".format(params, logType)
-    val jsOnload = "window.onload = " +
-      s"initLogPage('$logParams', $curLogLength, $startByte, $endByte, $logLength, $byteLength);"
+    val nextButton =
+      if (endByte < logLength) {
+        <a href={"?%s&logType=%s&offset=%s&byteLength=%s".
+          format(params, logType, endByte, byteLength)}>
+          <button type="button" class="btn btn-default">
+            Next {Utils.bytesToString(math.min(byteLength, logLength - endByte))}
+          </button>
+        </a>
+      } else {
+        <button type="button" class="btn btn-default" disabled="disabled">
+          Next 0 B
+        </button>
+      }
 
     val content =
-      <div>
-        {linkToMaster}
-        {range}
-        <div class="log-content" style="height:80vh; overflow:auto; padding:5px;">
-          <div>{moreButton}</div>
-          <pre>{logText}</pre>
-          {alert}
-          <div>{newButton}</div>
-        </div>
-        <script>{Unparsed(jsOnload)}</script>
-      </div>
-
+      <html>
+        <body>
+          {linkToMaster}
+          <div>
+            <div style="float:left; margin-right:10px">{backButton}</div>
+            <div style="float:left;">{range}</div>
+            <div style="float:right; margin-left:10px">{nextButton}</div>
+          </div>
+          <br />
+          <div style="height:500px; overflow:auto; padding:5px;">
+            <pre>{logText}</pre>
+          </div>
+        </body>
+      </html>
     UIUtils.basicSparkPage(content, logType + " log page for " + pageName)
   }
 
@@ -140,8 +147,7 @@ private[ui] class LogPage(parent: WorkerWebUI) extends WebUIPage("logPage") with
       val files = RollingFileAppender.getSortedRolledOverFiles(logDirectory, logType)
       logDebug(s"Sorted log files of type $logType in $logDirectory:\n${files.mkString("\n")}")
 
-      val fileLengths: Seq[Long] = files.map(Utils.getFileLength(_, worker.conf))
-      val totalLength = fileLengths.sum
+      val totalLength = files.map { _.length }.sum
       val offset = offsetOption.getOrElse(totalLength - byteLength)
       val startIndex = {
         if (offset < 0) {
@@ -154,7 +160,7 @@ private[ui] class LogPage(parent: WorkerWebUI) extends WebUIPage("logPage") with
       }
       val endIndex = math.min(startIndex + byteLength, totalLength)
       logDebug(s"Getting log from $startIndex to $endIndex")
-      val logText = Utils.offsetBytes(files, fileLengths, startIndex, endIndex)
+      val logText = Utils.offsetBytes(files, startIndex, endIndex)
       logDebug(s"Got log of length ${logText.length} bytes")
       (logText, startIndex, endIndex, totalLength)
     } catch {

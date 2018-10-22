@@ -187,7 +187,8 @@ private[deploy] class Worker(
     webUi = new WorkerWebUI(this, workDir, webUiPort)
     webUi.bind()
 
-    workerWebUiUrl = s"http://$publicAddress:${webUi.boundPort}"
+    val scheme = if (webUi.sslOptions.enabled) "https" else "http"
+    workerWebUiUrl = s"$scheme://$publicAddress:${webUi.boundPort}"
     registerWithMaster()
 
     metricsSystem.registerSource(workerSource)
@@ -479,7 +480,7 @@ private[deploy] class Worker(
           memoryUsed += memory_
           sendToMaster(ExecutorStateChanged(appId, execId, manager.state, None, None))
         } catch {
-          case e: Exception =>
+          case e: Exception => {
             logError(s"Failed to launch executor $appId/$execId for ${appDesc.name}.", e)
             if (executors.contains(appId + "/" + execId)) {
               executors(appId + "/" + execId).kill()
@@ -487,6 +488,7 @@ private[deploy] class Worker(
             }
             sendToMaster(ExecutorStateChanged(appId, execId, ExecutorState.FAILED,
               Some(e.toString), None))
+          }
         }
       }
 
@@ -495,7 +497,7 @@ private[deploy] class Worker(
 
     case KillExecutor(masterUrl, appId, execId) =>
       if (masterUrl != activeMasterUrl) {
-        logWarning("Invalid Master (" + masterUrl + ") attempted to kill executor " + execId)
+        logWarning("Invalid Master (" + masterUrl + ") attempted to launch executor " + execId)
       } else {
         val fullId = appId + "/" + execId
         executors.get(fullId) match {
@@ -507,7 +509,7 @@ private[deploy] class Worker(
         }
       }
 
-    case LaunchDriver(driverId, driverDesc) =>
+    case LaunchDriver(driverId, driverDesc) => {
       logInfo(s"Asked to launch driver $driverId")
       val driver = new DriverRunner(
         conf,
@@ -523,8 +525,9 @@ private[deploy] class Worker(
 
       coresUsed += driverDesc.cores
       memoryUsed += driverDesc.mem
+    }
 
-    case KillDriver(driverId) =>
+    case KillDriver(driverId) => {
       logInfo(s"Asked to kill driver $driverId")
       drivers.get(driverId) match {
         case Some(runner) =>
@@ -532,9 +535,11 @@ private[deploy] class Worker(
         case None =>
           logError(s"Asked to kill unknown driver $driverId")
       }
+    }
 
-    case driverStateChanged @ DriverStateChanged(driverId, state, exception) =>
+    case driverStateChanged @ DriverStateChanged(driverId, state, exception) => {
       handleDriverStateChanged(driverStateChanged)
+    }
 
     case ReregisterWithMaster =>
       reregisterWithMaster()

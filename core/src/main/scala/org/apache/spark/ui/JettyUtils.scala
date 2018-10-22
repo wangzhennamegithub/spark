@@ -25,12 +25,12 @@ import scala.collection.mutable.ArrayBuffer
 import scala.language.implicitConversions
 import scala.xml.Node
 
-import org.eclipse.jetty.server.{HttpConnectionFactory, Request, Server, ServerConnector}
+import org.eclipse.jetty.server.{Connector, Request, Server}
 import org.eclipse.jetty.server.handler._
+import org.eclipse.jetty.server.nio.SelectChannelConnector
+import org.eclipse.jetty.server.ssl.SslSelectChannelConnector
 import org.eclipse.jetty.servlet._
-import org.eclipse.jetty.servlets.gzip.GzipHandler
-import org.eclipse.jetty.util.component.LifeCycle
-import org.eclipse.jetty.util.thread.{QueuedThreadPool, ScheduledExecutorScheduler}
+import org.eclipse.jetty.util.thread.QueuedThreadPool
 import org.json4s.JValue
 import org.json4s.jackson.JsonMethods.{pretty, render}
 
@@ -42,9 +42,6 @@ import org.apache.spark.util.Utils
  * Utilities for launching a web server using Jetty's HTTP Server class
  */
 private[spark] object JettyUtils extends Logging {
-
-  val SPARK_CONNECTOR_NAME = "Spark"
-  val REDIRECT_CONNECTOR_NAME = "HttpsRedirect"
 
   // Base type for a function that returns something based on an HTTP request. Allows for
   // implicit conversion from many types of functions to jetty Handlers.
@@ -86,11 +83,13 @@ private[spark] object JettyUtils extends Logging {
             val result = servletParams.responder(request)
             response.setHeader("Cache-Control", "no-cache, no-store, must-revalidate")
             response.setHeader("X-Frame-Options", xFrameOptionsValue)
-            response.getWriter.print(servletParams.extractFn(result))
+            // scalastyle:off println
+            response.getWriter.println(servletParams.extractFn(result))
+            // scalastyle:on println
           } else {
-            response.setStatus(HttpServletResponse.SC_FORBIDDEN)
+            response.setStatus(HttpServletResponse.SC_UNAUTHORIZED)
             response.setHeader("Cache-Control", "no-cache, no-store, must-revalidate")
-            response.sendError(HttpServletResponse.SC_FORBIDDEN,
+            response.sendError(HttpServletResponse.SC_UNAUTHORIZED,
               "User is not authorized to access this page.")
           }
         } catch {
@@ -234,93 +233,71 @@ private[spark] object JettyUtils extends Logging {
       conf: SparkConf,
       serverName: String = ""): ServerInfo = {
 
+    val collection = new ContextHandlerCollection
     addFilters(handlers, conf)
 
     val gzipHandlers = handlers.map { h =>
-      h.setVirtualHosts(Array("@" + SPARK_CONNECTOR_NAME))
-
       val gzipHandler = new GzipHandler
       gzipHandler.setHandler(h)
       gzipHandler
     }
 
     // Bind to the given port, or throw a java.net.BindException if the port is occupied
-    def connect(currentPort: Int): ((Server, Option[Int]), Int) = {
+    def connect(currentPort: Int): (Server, Int) = {
+      val server = new Server
+      val connectors = new ArrayBuffer[Connector]
+      // Create a connector on port currentPort to listen for HTTP requests
+      val httpConnector = new SelectChannelConnector()
+      httpConnector.setPort(currentPort)
+      connectors += httpConnector
+
+      sslOptions.createJettySslContextFactory().foreach { factory =>
+        // If the new port wraps around, do not try a privileged port.
+        val securePort =
+          if (currentPort != 0) {
+            (currentPort + 400 - 1024) % (65536 - 1024) + 1024
+          } else {
+            0
+          }
+        val scheme = "https"
+        // Create a connector on port securePort to listen for HTTPS requests
+        val connector = new SslSelectChannelConnector(factory)
+        connector.setPort(securePort)
+        connectors += connector
+
+        // redirect the HTTP requests to HTTPS port
+        collection.addHandler(createRedirectHttpsHandler(securePort, scheme))
+      }
+
+      gzipHandlers.foreach(collection.addHandler)
+      connectors.foreach(_.setHost(hostName))
+      // As each acceptor and each selector will use one thread, the number of threads should at
+      // least be the number of acceptors and selectors plus 1. (See SPARK-13776)
+      var minThreads = 1
+      connectors.foreach { c =>
+        // Currently we only use "SelectChannelConnector"
+        val connector = c.asInstanceOf[SelectChannelConnector]
+        // Limit the max acceptor number to 8 so that we don't waste a lot of threads
+        connector.setAcceptors(math.min(connector.getAcceptors, 8))
+        // The number of selectors always equals to the number of acceptors
+        minThreads += connector.getAcceptors * 2
+      }
+      server.setConnectors(connectors.toArray)
+
       val pool = new QueuedThreadPool
       if (serverName.nonEmpty) {
         pool.setName(serverName)
       }
-      pool.setDaemon(true)
-
-      val server = new Server(pool)
-      val connectors = new ArrayBuffer[ServerConnector]()
-      val collection = new ContextHandlerCollection
-
-      // Create a connector on port currentPort to listen for HTTP requests
-      val httpConnector = new ServerConnector(
-        server,
-        null,
-        // Call this full constructor to set this, which forces daemon threads:
-        new ScheduledExecutorScheduler(s"$serverName-JettyScheduler", true),
-        null,
-        -1,
-        -1,
-        new HttpConnectionFactory())
-      httpConnector.setPort(currentPort)
-      connectors += httpConnector
-
-      val httpsConnector = sslOptions.createJettySslContextFactory() match {
-        case Some(factory) =>
-          // If the new port wraps around, do not try a privileged port.
-          val securePort =
-            if (currentPort != 0) {
-              (currentPort + 400 - 1024) % (65536 - 1024) + 1024
-            } else {
-              0
-            }
-          val scheme = "https"
-          // Create a connector on port securePort to listen for HTTPS requests
-          val connector = new ServerConnector(server, factory)
-          connector.setPort(securePort)
-          connector.setName(SPARK_CONNECTOR_NAME)
-          connectors += connector
-
-          // redirect the HTTP requests to HTTPS port
-          httpConnector.setName(REDIRECT_CONNECTOR_NAME)
-          collection.addHandler(createRedirectHttpsHandler(connector, scheme))
-          Some(connector)
-
-        case None =>
-          // No SSL, so the HTTP connector becomes the official one where all contexts bind.
-          httpConnector.setName(SPARK_CONNECTOR_NAME)
-          None
-      }
-
-      // As each acceptor and each selector will use one thread, the number of threads should at
-      // least be the number of acceptors and selectors plus 1. (See SPARK-13776)
-      var minThreads = 1
-      connectors.foreach { connector =>
-        // Currently we only use "SelectChannelConnector"
-        // Limit the max acceptor number to 8 so that we don't waste a lot of threads
-        connector.setAcceptQueueSize(math.min(connector.getAcceptors, 8))
-        connector.setHost(hostName)
-        // The number of selectors always equals to the number of acceptors
-        minThreads += connector.getAcceptors * 2
-      }
       pool.setMaxThreads(math.max(pool.getMaxThreads, minThreads))
-
+      pool.setDaemon(true)
+      server.setThreadPool(pool)
       val errorHandler = new ErrorHandler()
       errorHandler.setShowStacks(true)
-      errorHandler.setServer(server)
       server.addBean(errorHandler)
-
-      gzipHandlers.foreach(collection.addHandler)
       server.setHandler(collection)
-
-      server.setConnectors(connectors.toArray)
       try {
         server.start()
-        ((server, httpsConnector.map(_.getLocalPort())), httpConnector.getLocalPort)
+        (server, server.getConnectors.head.getLocalPort)
       } catch {
         case e: Exception =>
           server.stop()
@@ -329,18 +306,13 @@ private[spark] object JettyUtils extends Logging {
       }
     }
 
-    val ((server, securePort), boundPort) = Utils.startServiceOnPort(port, connect, conf,
-      serverName)
-    ServerInfo(server, boundPort, securePort,
-      server.getHandler().asInstanceOf[ContextHandlerCollection])
+    val (server, boundPort) = Utils.startServiceOnPort[Server](port, connect, conf, serverName)
+    ServerInfo(server, boundPort, collection)
   }
 
-  private def createRedirectHttpsHandler(
-      httpsConnector: ServerConnector,
-      scheme: String): ContextHandler = {
+  private def createRedirectHttpsHandler(securePort: Int, scheme: String): ContextHandler = {
     val redirectHandler: ContextHandler = new ContextHandler
     redirectHandler.setContextPath("/")
-    redirectHandler.setVirtualHosts(Array("@" + REDIRECT_CONNECTOR_NAME))
     redirectHandler.setHandler(new AbstractHandler {
       override def handle(
           target: String,
@@ -350,8 +322,8 @@ private[spark] object JettyUtils extends Logging {
         if (baseRequest.isSecure) {
           return
         }
-        val httpsURI = createRedirectURI(scheme, baseRequest.getServerName,
-          httpsConnector.getLocalPort, baseRequest.getRequestURI, baseRequest.getQueryString)
+        val httpsURI = createRedirectURI(scheme, baseRequest.getServerName, securePort,
+          baseRequest.getRequestURI, baseRequest.getQueryString)
         response.setContentLength(0)
         response.encodeRedirectURL(httpsURI)
         response.sendRedirect(httpsURI)
@@ -378,31 +350,4 @@ private[spark] object JettyUtils extends Logging {
 private[spark] case class ServerInfo(
     server: Server,
     boundPort: Int,
-    securePort: Option[Int],
-    private val rootHandler: ContextHandlerCollection) {
-
-  def addHandler(handler: ContextHandler): Unit = {
-    handler.setVirtualHosts(Array("@" + JettyUtils.SPARK_CONNECTOR_NAME))
-    rootHandler.addHandler(handler)
-    if (!handler.isStarted()) {
-      handler.start()
-    }
-  }
-
-  def removeHandler(handler: ContextHandler): Unit = {
-    rootHandler.removeHandler(handler)
-    if (handler.isStarted) {
-      handler.stop()
-    }
-  }
-
-  def stop(): Unit = {
-    server.stop()
-    // Stop the ThreadPool if it supports stop() method (through LifeCycle).
-    // It is needed because stopping the Server won't stop the ThreadPool it uses.
-    val threadPool = server.getThreadPool
-    if (threadPool != null && threadPool.isInstanceOf[LifeCycle]) {
-      threadPool.asInstanceOf[LifeCycle].stop
-    }
-  }
-}
+    rootHandler: ContextHandlerCollection)

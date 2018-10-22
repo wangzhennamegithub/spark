@@ -18,23 +18,18 @@
 package org.apache.spark
 
 import java.io.{ByteArrayInputStream, File, FileInputStream, FileOutputStream}
-import java.net.{HttpURLConnection, URI, URL}
+import java.net.{URI, URL}
 import java.nio.charset.StandardCharsets
 import java.nio.file.Paths
-import java.security.SecureRandom
-import java.security.cert.X509Certificate
 import java.util.Arrays
-import java.util.concurrent.{CountDownLatch, TimeUnit}
 import java.util.jar.{JarEntry, JarOutputStream}
-import javax.net.ssl._
-import javax.servlet.http.HttpServletResponse
-import javax.tools.{JavaFileObject, SimpleJavaFileObject, ToolProvider}
 
 import scala.collection.JavaConverters._
 import scala.collection.mutable
 import scala.collection.mutable.ArrayBuffer
 
 import com.google.common.io.{ByteStreams, Files}
+import javax.tools.{JavaFileObject, SimpleJavaFileObject, ToolProvider}
 
 import org.apache.spark.executor.TaskMetrics
 import org.apache.spark.scheduler._
@@ -186,55 +181,6 @@ private[spark] object TestUtils {
     assert(spillListener.numSpilledStages == 0, s"expected $identifier to not spill, but did")
   }
 
-  /**
-   * Returns the response code and url (if redirected) from an HTTP(S) URL.
-   */
-  def httpResponseCodeAndURL(
-      url: URL,
-      method: String = "GET",
-      headers: Seq[(String, String)] = Nil): (Int, Option[String]) = {
-    val connection = url.openConnection().asInstanceOf[HttpURLConnection]
-    connection.setRequestMethod(method)
-    headers.foreach { case (k, v) => connection.setRequestProperty(k, v) }
-
-    // Disable cert and host name validation for HTTPS tests.
-    if (connection.isInstanceOf[HttpsURLConnection]) {
-      val sslCtx = SSLContext.getInstance("SSL")
-      val trustManager = new X509TrustManager {
-        override def getAcceptedIssuers(): Array[X509Certificate] = null
-        override def checkClientTrusted(x509Certificates: Array[X509Certificate], s: String) {}
-        override def checkServerTrusted(x509Certificates: Array[X509Certificate], s: String) {}
-      }
-      val verifier = new HostnameVerifier() {
-        override def verify(hostname: String, session: SSLSession): Boolean = true
-      }
-      sslCtx.init(null, Array(trustManager), new SecureRandom())
-      connection.asInstanceOf[HttpsURLConnection].setSSLSocketFactory(sslCtx.getSocketFactory())
-      connection.asInstanceOf[HttpsURLConnection].setHostnameVerifier(verifier)
-      connection.setInstanceFollowRedirects(false)
-    }
-
-    try {
-      connection.connect()
-      if (connection.getResponseCode == HttpServletResponse.SC_FOUND) {
-        (connection.getResponseCode, Option(connection.getHeaderField("Location")))
-      } else {
-        (connection.getResponseCode(), None)
-      }
-    } finally {
-      connection.disconnect()
-    }
-  }
-
-  /**
-   * Returns the response code from an HTTP(S) URL.
-   */
-  def httpResponseCode(
-      url: URL,
-      method: String = "GET",
-      headers: Seq[(String, String)] = Nil): Int = {
-    httpResponseCodeAndURL(url, method, headers)._1
-  }
 }
 
 
@@ -244,14 +190,8 @@ private[spark] object TestUtils {
 private class SpillListener extends SparkListener {
   private val stageIdToTaskMetrics = new mutable.HashMap[Int, ArrayBuffer[TaskMetrics]]
   private val spilledStageIds = new mutable.HashSet[Int]
-  private val stagesDone = new CountDownLatch(1)
 
-  def numSpilledStages: Int = {
-    // Long timeout, just in case somehow the job end isn't notified.
-    // Fails if a timeout occurs
-    assert(stagesDone.await(10, TimeUnit.SECONDS))
-    spilledStageIds.size
-  }
+  def numSpilledStages: Int = spilledStageIds.size
 
   override def onTaskEnd(taskEnd: SparkListenerTaskEnd): Unit = {
     stageIdToTaskMetrics.getOrElseUpdate(
@@ -265,9 +205,5 @@ private class SpillListener extends SparkListener {
     if (spilled) {
       spilledStageIds += stageId
     }
-  }
-
-  override def onJobEnd(jobEnd: SparkListenerJobEnd): Unit = {
-    stagesDone.countDown()
   }
 }

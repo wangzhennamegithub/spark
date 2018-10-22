@@ -19,14 +19,13 @@ package org.apache.spark.util.collection
 
 import org.apache.spark.SparkEnv
 import org.apache.spark.internal.Logging
-import org.apache.spark.memory.{MemoryConsumer, MemoryMode, TaskMemoryManager}
+import org.apache.spark.memory.{MemoryMode, TaskMemoryManager}
 
 /**
  * Spills contents of an in-memory collection to disk when the memory threshold
  * has been exceeded.
  */
-private[spark] abstract class Spillable[C](taskMemoryManager: TaskMemoryManager)
-  extends MemoryConsumer(taskMemoryManager) with Logging {
+private[spark] trait Spillable[C] extends Logging {
   /**
    * Spills the current in-memory collection to disk, and releases the memory.
    *
@@ -34,18 +33,15 @@ private[spark] abstract class Spillable[C](taskMemoryManager: TaskMemoryManager)
    */
   protected def spill(collection: C): Unit
 
-  /**
-   * Force to spilling the current in-memory collection to disk to release memory,
-   * It will be called by TaskMemoryManager when there is not enough memory for the task.
-   */
-  protected def forceSpill(): Boolean
-
   // Number of elements read from input since last spill
   protected def elementsRead: Long = _elementsRead
 
   // Called by subclasses every time a record is read
   // It's used for checking spilling frequency
   protected def addElementsRead(): Unit = { _elementsRead += 1 }
+
+  // Memory manager that can be used to acquire/release memory
+  protected[this] def taskMemoryManager: TaskMemoryManager
 
   // Initial threshold for the size of a collection before we start tracking its memory usage
   // For testing only
@@ -59,13 +55,13 @@ private[spark] abstract class Spillable[C](taskMemoryManager: TaskMemoryManager)
 
   // Threshold for this collection's size in bytes before we start tracking its memory usage
   // To avoid a large number of small spills, initialize this to a value orders of magnitude > 0
-  @volatile private[this] var myMemoryThreshold = initialMemoryThreshold
+  private[this] var myMemoryThreshold = initialMemoryThreshold
 
   // Number of elements read from input since last spill
   private[this] var _elementsRead = 0L
 
   // Number of bytes spilled in total
-  @volatile private[this] var _memoryBytesSpilled = 0L
+  private[this] var _memoryBytesSpilled = 0L
 
   // Number of spills
   private[this] var _spillCount = 0
@@ -83,7 +79,8 @@ private[spark] abstract class Spillable[C](taskMemoryManager: TaskMemoryManager)
     if (elementsRead % 32 == 0 && currentMemory >= myMemoryThreshold) {
       // Claim up to double our current memory from the shuffle memory pool
       val amountToRequest = 2 * currentMemory - myMemoryThreshold
-      val granted = acquireMemory(amountToRequest)
+      val granted =
+        taskMemoryManager.acquireExecutionMemory(amountToRequest, MemoryMode.ON_HEAP, null)
       myMemoryThreshold += granted
       // If we were granted too little memory to grow further (either tryToAcquire returned 0,
       // or we already had more memory than myMemoryThreshold), spill the current collection
@@ -103,26 +100,6 @@ private[spark] abstract class Spillable[C](taskMemoryManager: TaskMemoryManager)
   }
 
   /**
-   * Spill some data to disk to release memory, which will be called by TaskMemoryManager
-   * when there is not enough memory for the task.
-   */
-  override def spill(size: Long, trigger: MemoryConsumer): Long = {
-    if (trigger != this && taskMemoryManager.getTungstenMemoryMode == MemoryMode.ON_HEAP) {
-      val isSpilled = forceSpill()
-      if (!isSpilled) {
-        0L
-      } else {
-        val freeMemory = myMemoryThreshold - initialMemoryThreshold
-        _memoryBytesSpilled += freeMemory
-        releaseMemory()
-        freeMemory
-      }
-    } else {
-      0L
-    }
-  }
-
-  /**
    * @return number of bytes spilled in total
    */
   def memoryBytesSpilled: Long = _memoryBytesSpilled
@@ -131,7 +108,9 @@ private[spark] abstract class Spillable[C](taskMemoryManager: TaskMemoryManager)
    * Release our memory back to the execution pool so that other tasks can grab it.
    */
   def releaseMemory(): Unit = {
-    freeMemory(myMemoryThreshold - initialMemoryThreshold)
+    // The amount we requested does not include the initial memory tracking threshold
+    taskMemoryManager.releaseExecutionMemory(
+      myMemoryThreshold - initialMemoryThreshold, MemoryMode.ON_HEAP, null)
     myMemoryThreshold = initialMemoryThreshold
   }
 

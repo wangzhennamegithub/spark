@@ -40,12 +40,12 @@ abstract class PersistenceEngine {
    * Defines how the object is serialized and persisted. Implementation will
    * depend on the store used.
    */
-  def persist(name: String, obj: Object): Unit
+  def persist(name: String, obj: Object)
 
   /**
    * Defines how the object referred by its name is removed from the store.
    */
-  def unpersist(name: String): Unit
+  def unpersist(name: String)
 
   /**
    * Gives all objects, matching a prefix. This defines how objects are

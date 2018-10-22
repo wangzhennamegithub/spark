@@ -22,6 +22,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 
 import scala.collection.immutable.Map
+import scala.collection.mutable.ListBuffer
 import scala.reflect.ClassTag
 
 import org.apache.hadoop.conf.{Configurable, Configuration}
@@ -42,6 +43,7 @@ import org.apache.spark._
 import org.apache.spark.annotation.DeveloperApi
 import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.deploy.SparkHadoopUtil
+import org.apache.spark.executor.DataReadMethod
 import org.apache.spark.internal.Logging
 import org.apache.spark.rdd.HadoopRDD.HadoopMapPartitionsWithSplitRDD
 import org.apache.spark.scheduler.{HDFSCacheTaskLocation, HostTaskLocation}
@@ -51,14 +53,14 @@ import org.apache.spark.util.{NextIterator, SerializableConfiguration, ShutdownH
 /**
  * A Spark split class that wraps around a Hadoop InputSplit.
  */
-private[spark] class HadoopPartition(rddId: Int, override val index: Int, s: InputSplit)
+private[spark] class HadoopPartition(rddId: Int, idx: Int, s: InputSplit)
   extends Partition {
 
   val inputSplit = new SerializableWritable[InputSplit](s)
 
-  override def hashCode(): Int = 31 * (31 + rddId) + index
+  override def hashCode(): Int = 41 * (41 + rddId) + idx
 
-  override def equals(other: Any): Boolean = super.equals(other)
+  override val index: Int = idx
 
   /**
    * Get any environment variables that should be added to the users environment when running pipes
@@ -68,7 +70,7 @@ private[spark] class HadoopPartition(rddId: Int, override val index: Int, s: Inp
     val envVars: Map[String, String] = if (inputSplit.value.isInstanceOf[FileSplit]) {
       val is: FileSplit = inputSplit.value.asInstanceOf[FileSplit]
       // map_input_file is deprecated in favor of mapreduce_map_input_file but set both
-      // since it's not removed yet
+      // since its not removed yet
       Map("map_input_file" -> is.getPath().toString(),
         "mapreduce_map_input_file" -> is.getPath().toString())
     } else {
@@ -211,13 +213,15 @@ class HadoopRDD[K, V](
       logInfo("Input split: " + split.inputSplit)
       val jobConf = getJobConf()
 
-      val inputMetrics = context.taskMetrics().inputMetrics
+      // TODO: there is a lot of duplicate code between this and NewHadoopRDD and SqlNewHadoopRDD
+
+      val inputMetrics = context.taskMetrics().registerInputMetrics(DataReadMethod.Hadoop)
       val existingBytesRead = inputMetrics.bytesRead
 
       // Sets the thread local variable for the file's name
       split.inputSplit.value match {
-        case fs: FileSplit => InputFileNameHolder.setInputFileName(fs.getPath.toString)
-        case _ => InputFileNameHolder.unsetInputFileName()
+        case fs: FileSplit => SqlNewHadoopRDDState.setInputFileName(fs.getPath.toString)
+        case _ => SqlNewHadoopRDDState.unsetInputFileName()
       }
 
       // Find a function that will return the FileSystem bytes read by this thread. Do this before
@@ -257,7 +261,7 @@ class HadoopRDD[K, V](
             finished = true
         }
         if (!finished) {
-          inputMetrics.incRecordsRead(1)
+          inputMetrics.incRecordsReadInternal(1)
         }
         if (inputMetrics.recordsRead % SparkHadoopUtil.UPDATE_INPUT_METRICS_INTERVAL_RECORDS == 0) {
           updateBytesRead()
@@ -267,7 +271,7 @@ class HadoopRDD[K, V](
 
       override def close() {
         if (reader != null) {
-          InputFileNameHolder.unsetInputFileName()
+          SqlNewHadoopRDDState.unsetInputFileName()
           // Close the reader and release it. Note: it's very important that we don't close the
           // reader more than once, since that exposes us to MAPREDUCE-5918 when running against
           // Hadoop 1.x and older Hadoop 2.x releases. That bug can lead to non-deterministic
@@ -289,7 +293,7 @@ class HadoopRDD[K, V](
             // If we can't get the bytes read from the FS stats, fall back to the split size,
             // which may be inaccurate.
             try {
-              inputMetrics.incBytesRead(split.inputSplit.value.getLength)
+              inputMetrics.incBytesReadInternal(split.inputSplit.value.getLength)
             } catch {
               case e: java.io.IOException =>
                 logWarning("Unable to get input size to set InputMetrics for task", e)
@@ -316,7 +320,7 @@ class HadoopRDD[K, V](
         try {
           val lsplit = c.inputSplitWithLocationInfo.cast(hsplit)
           val infos = c.getLocationInfo.invoke(lsplit).asInstanceOf[Array[AnyRef]]
-          HadoopRDD.convertSplitLocationInfo(infos)
+          Some(HadoopRDD.convertSplitLocationInfo(infos))
         } catch {
           case e: Exception =>
             logDebug("Failed to use InputSplitWithLocations.", e)
@@ -333,7 +337,7 @@ class HadoopRDD[K, V](
 
   override def persist(storageLevel: StorageLevel): this.type = {
     if (storageLevel.deserialized) {
-      logWarning("Caching HadoopRDDs as deserialized objects usually leads to undesired" +
+      logWarning("Caching NewHadoopRDDs as deserialized objects usually leads to undesired" +
         " behavior because Hadoop's RecordReader reuses the same Writable object for all records." +
         " Use a map transformation to make copies of the records.")
     }
@@ -418,20 +422,21 @@ private[spark] object HadoopRDD extends Logging {
       None
   }
 
-  private[spark] def convertSplitLocationInfo(infos: Array[AnyRef]): Option[Seq[String]] = {
-    Option(infos).map(_.flatMap { loc =>
-      val reflections = HadoopRDD.SPLIT_INFO_REFLECTIONS.get
-      val locationStr = reflections.getLocation.invoke(loc).asInstanceOf[String]
+  private[spark] def convertSplitLocationInfo(infos: Array[AnyRef]): Seq[String] = {
+    val out = ListBuffer[String]()
+    infos.foreach { loc => {
+      val locationStr = HadoopRDD.SPLIT_INFO_REFLECTIONS.get.
+        getLocation.invoke(loc).asInstanceOf[String]
       if (locationStr != "localhost") {
-        if (reflections.isInMemory.invoke(loc).asInstanceOf[Boolean]) {
-          logDebug(s"Partition $locationStr is cached by Hadoop.")
-          Some(HDFSCacheTaskLocation(locationStr).toString)
+        if (HadoopRDD.SPLIT_INFO_REFLECTIONS.get.isInMemory.
+                invoke(loc).asInstanceOf[Boolean]) {
+          logDebug("Partition " + locationStr + " is cached by Hadoop.")
+          out += new HDFSCacheTaskLocation(locationStr).toString
         } else {
-          Some(HostTaskLocation(locationStr).toString)
+          out += new HostTaskLocation(locationStr).toString
         }
-      } else {
-        None
       }
-    })
+    }}
+    out.seq
   }
 }

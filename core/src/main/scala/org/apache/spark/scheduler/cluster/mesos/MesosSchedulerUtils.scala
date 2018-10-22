@@ -124,10 +124,11 @@ private[mesos] trait MesosSchedulerUtils extends Logging {
               markErr()
             }
           } catch {
-            case e: Exception =>
+            case e: Exception => {
               logError("driver.run() failed", e)
               error = Some(e)
               markErr()
+            }
           }
         }
       }.start()
@@ -183,7 +184,7 @@ private[mesos] trait MesosSchedulerUtils extends Logging {
     var remain = amountToUse
     var requestedResources = new ArrayBuffer[Resource]
     val remainingResources = resources.asScala.map {
-      case r =>
+      case r => {
         if (remain > 0 &&
           r.getType == Value.Type.SCALAR &&
           r.getScalar.getValue > 0.0 &&
@@ -195,6 +196,7 @@ private[mesos] trait MesosSchedulerUtils extends Logging {
         } else {
           r
         }
+      }
     }
 
     // Filter any resource that has depleted.
@@ -226,7 +228,7 @@ private[mesos] trait MesosSchedulerUtils extends Logging {
    * @return
    */
   protected def toAttributeMap(offerAttributes: JList[Attribute]): Map[String, GeneratedMessage] = {
-    offerAttributes.asScala.map { attr =>
+    offerAttributes.asScala.map(attr => {
       val attrValue = attr.getType match {
         case Value.Type.SCALAR => attr.getScalar
         case Value.Type.RANGES => attr.getRanges
@@ -234,7 +236,7 @@ private[mesos] trait MesosSchedulerUtils extends Logging {
         case Value.Type.TEXT => attr.getText
       }
       (attr.getName, attrValue)
-    }.toMap
+    }).toMap
   }
 
 
@@ -350,10 +352,6 @@ private[mesos] trait MesosSchedulerUtils extends Logging {
 
   protected def getRejectOfferDurationForUnmetConstraints(sc: SparkContext): Long = {
     sc.conf.getTimeAsSeconds("spark.mesos.rejectOfferDurationForUnmetConstraints", "120s")
-  }
-
-  protected def getRejectOfferDurationForReachedMaxCores(sc: SparkContext): Long = {
-    sc.conf.getTimeAsSeconds("spark.mesos.rejectOfferDurationForReachedMaxCores", "120s")
   }
 
 }
