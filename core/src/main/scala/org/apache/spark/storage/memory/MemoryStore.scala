@@ -31,7 +31,7 @@ import org.apache.spark.{SparkConf, TaskContext}
 import org.apache.spark.internal.Logging
 import org.apache.spark.memory.{MemoryManager, MemoryMode}
 import org.apache.spark.serializer.{SerializationStream, SerializerManager}
-import org.apache.spark.storage.{BlockId, BlockInfoManager, BlockManager, StorageLevel}
+import evictBlocksToFreeSpaceorg.apache.spark.storage.{BlockId, BlockInfoManager, BlockManager, StorageLevel}
 import org.apache.spark.unsafe.Platform
 import org.apache.spark.util.{CompletionIterator, SizeEstimator, Utils}
 import org.apache.spark.util.collection.SizeTrackingVector
@@ -458,21 +458,22 @@ private[spark] class MemoryStore(
    * @return the amount of memory (in bytes) freed by eviction
    */
   private[spark] def evictBlocksToFreeSpace(
-      blockId: Option[BlockId],
-      space: Long,
-      memoryMode: MemoryMode): Long = {
+      blockId: Option[BlockId],     //Block ID
+      space: Long,                  //内存大小
+      memoryMode: MemoryMode): Long = {     //block集合
     assert(space > 0)
     memoryManager.synchronized {
       var freedMemory = 0L
+      var bufferBlock = 0L
       val rddToAdd = blockId.flatMap(getRddId)
-      val selectedBlocks = new ArrayBuffer[BlockId]
+      val selectedBlocks = new ArrayBuffer[BlockId]   //判断Block是否可以移除
       def blockIsEvictable(blockId: BlockId, entry: MemoryEntry[_]): Boolean = {
         entry.memoryMode == memoryMode && (rddToAdd.isEmpty || rddToAdd != getRddId(blockId))
       }
       // This is synchronized to ensure that the set of entries is not changed
       // (because of getValue or getBytes) while traversing the iterator, as that
       // can lead to exceptions.
-      entries.synchronized {
+      entries.synchronized {     // 遍历entries
         val iterator = entries.entrySet().iterator()
         while (freedMemory < space && iterator.hasNext) {
           val pair = iterator.next()
@@ -484,7 +485,9 @@ private[spark] class MemoryStore(
             // non-blocking "tryLock" here in order to ignore blocks which are locked for reading:
             if (blockInfoManager.lockForWriting(blockId, blocking = false).isDefined) {
               selectedBlocks += blockId
-              freedMemory += pair.getValue.size
+              bufferBlock += selectedBlocks    //自触发快排缓冲池
+              selectedBlocks += bufferBlock  // 记录候选可移除的blocks
+              freedMemory += pair.getValue.size  //
             }
           }
         }
@@ -517,7 +520,7 @@ private[spark] class MemoryStore(
         val data = entry match {
           case DeserializedMemoryEntry(values, _, _) => Left(values)
           case SerializedMemoryEntry(buffer, _, _) => Right(buffer)
-        }
+        }    // 调用BlockManager的方法删除block
         val newEffectiveStorageLevel =
           blockEvictionHandler.dropFromMemory(blockId, () => data)(entry.classTag)
         if (newEffectiveStorageLevel.isValid) {
@@ -539,7 +542,7 @@ private[spark] class MemoryStore(
           // This should never be null as only one task should be dropping
           // blocks and removing entries. However the check is still here for
           // future safety.
-          if (entry != null) {
+          if (entry != null) {     // 删除block
             dropBlock(blockId, entry)
           }
         }
