@@ -25,6 +25,8 @@ import scala.collection.mutable
 import scala.collection.mutable.ArrayBuffer
 import scala.reflect.ClassTag
 
+import org.apache.spark.scheduler
+
 import com.google.common.io.ByteStreams
 
 import org.apache.spark.{SparkConf, TaskContext}
@@ -484,12 +486,23 @@ private[spark] class MemoryStore(
             // an exclusive write lock on blocks which are candidates for eviction. We perform a
             // non-blocking "tryLock" here in order to ignore blocks which are locked for reading:
             if (blockInfoManager.lockForWriting(blockId, blocking = false).isDefined) {
-              selectedBlocks += blockId
-              bufferBlock += selectedBlocks    //自触发快排缓冲池
+              if((selectedBlocks += blockId)>3)
+              bufferBlock = selectedBlocks    //自触缓冲池
+              quickSort(getValues(bufferBlock)*attemptNumber(bufferBlock)/getSize(bufferBlock))
               selectedBlocks += bufferBlock  // 记录候选可移除的blocks
               freedMemory += pair.getValue.size  //
             }
           }
+        }
+      }
+
+      def quickSort(list: List[Int]): List[Int] = {
+        list match {
+          case Nil => Nil
+          case List() => List()
+          case head :: tail =>
+            val (left, right) = tail.partition(_ < head)
+            quickSort(left) ::: head :: quickSort(right)
         }
       }
 
